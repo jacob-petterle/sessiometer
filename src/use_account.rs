@@ -1368,10 +1368,13 @@ mod tests {
                     usage: Usage {
                         session: 0.10,
                         weekly,
+                        weekly_all: weekly,
+                        weekly_scoped: None,
                         weekly_resets_at: None,
                         session_resets_at: None,
                     },
                     severity: None,
+                    weekly_scoped_model: None,
                 }),
                 Probe::Dead => Err(Error::UsageUnauthorized),
                 Probe::ScopeMissing => Err(Error::UsageScopeMissing),

@@ -3789,6 +3789,8 @@ mod tests {
                 &Usage {
                     session: 0.30 + k / 100.0,
                     weekly: 0.40,
+                    weekly_all: 0.40,
+                    weekly_scoped: None,
                     weekly_resets_at: None,
                     session_resets_at: Some(5_000 + i as i64),
                 },
@@ -6124,6 +6126,8 @@ mod tests {
             &Ok(Usage {
                 session: 0.10,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),

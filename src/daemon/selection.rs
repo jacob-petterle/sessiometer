@@ -335,24 +335,32 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100), // soonest overall — but it is active
                 session_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.50,
-                weekly: 0.60,                // less headroom than index 2…
+                weekly: 0.60, // less headroom than index 2…
+                weekly_all: 0.60,
+                weekly_scoped: None,
                 weekly_resets_at: Some(200), // …but resets soonest among viable -> winner
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
-                weekly: 0.20,                // most headroom — would win the OLD rule…
+                weekly: 0.20, // most headroom — would win the OLD rule…
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: Some(500), // …but resets latest
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.85,
                 weekly: 0.01,
+                weekly_all: 0.01,
+                weekly_scoped: None,
                 weekly_resets_at: Some(50), // earliest of all — but session over floor
                 session_resets_at: None,
             }), // session over floor -> not viable
@@ -375,18 +383,24 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100),
                 session_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.50,
                 weekly: 0.60,
+                weekly_all: 0.60,
+                weekly_scoped: None,
                 weekly_resets_at: Some(200),
                 session_resets_at: None,
             }), // winner — soonest reset among viable
             Some(Usage {
                 session: 0.10,
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: Some(500),
                 session_resets_at: None,
             }), // more headroom, but later reset
@@ -406,6 +420,8 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100),
                 session_resets_at: None,
             }), // index 0 = active (excluded)
@@ -413,6 +429,8 @@ mod tests {
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30,
+                weekly_all: 0.30,
+                weekly_scoped: None,
                 weekly_resets_at: Some(400),
                 session_resets_at: None,
             }), // the only viable candidate
@@ -434,18 +452,24 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }), // winner by roster order (no reset to compare)
             Some(Usage {
                 session: 0.20,
                 weekly: 0.30,
+                weekly_all: 0.30,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -462,6 +486,8 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -469,6 +495,8 @@ mod tests {
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30,
+                weekly_all: 0.30,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -485,18 +513,24 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.90,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.81,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -516,18 +550,24 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100),
                 session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.40,
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: Some(300), // tie -> first of the tie wins
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.20,
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: Some(300), // tie, lower session (the OLD winner)
                 session_resets_at: None,
             }),
@@ -547,18 +587,24 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
-                weekly: 0.05,           // more headroom + earlier index…
+                weekly: 0.05, // more headroom + earlier index…
+                weekly_all: 0.05,
+                weekly_scoped: None,
                 weekly_resets_at: None, // …but no known reset -> sorts last
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.40,
+                weekly_all: 0.40,
+                weekly_scoped: None,
                 weekly_resets_at: Some(900), // a known reset -> preferred
                 session_resets_at: None,
             }),
@@ -578,18 +624,24 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30, // more weekly used, earlier index -> winner
+                weekly_all: 0.30,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.05, // most headroom, but no reset and a later index
+                weekly_all: 0.05,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -613,18 +665,24 @@ mod tests {
             Some(Usage {
                 session: 0.50,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.95, // at the session trigger -> not viable, however soon it resets
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100), // soonest reset, but session-saturated
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.05, // the only session-fresh other
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: Some(300), // later reset, but viable
                 session_resets_at: None,
             }),
@@ -647,18 +705,24 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100),
                 session_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.85, // clears the 0.95 gate, so viable with the floor off…
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(200), // …and the soonest-reset viable target
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.05,
                 weekly: 0.60,
+                weekly_all: 0.60,
+                weekly_scoped: None,
                 weekly_resets_at: Some(300),
                 session_resets_at: None,
             }), // session-fresh, resets later
@@ -684,18 +748,24 @@ mod tests {
             Some(Usage {
                 session: 0.50,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.99, // weekly-exhausted -> not viable despite low session
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.20, // the only non-exhausted other account
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -722,6 +792,8 @@ mod tests {
             Some(Usage {
                 session: 0.50,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }), // active (excluded)
@@ -729,12 +801,16 @@ mod tests {
                 session: 0.10,
                 weekly: 0.975, // INSIDE the tail-margin band: below the raw ceiling, at/above the
                 // fire point. Viable under the pre-#607 raw line; must NOT be now.
+                weekly_all: 0.975,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.20, // genuinely open
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -770,18 +846,24 @@ mod tests {
             Some(Usage {
                 session: 0.50,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.98, // exactly at the trigger -> exhausted (>=)
+                weekly_all: 0.98,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 1.00,
+                weekly_all: 1.00,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -800,18 +882,24 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(500),
                 session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.05,
+                weekly_all: 0.05,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100), // soonest reset — the would-be winner…
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30,
+                weekly_all: 0.30,
+                weekly_scoped: None,
                 weekly_resets_at: Some(200),
                 session_resets_at: None,
             }),
@@ -829,18 +917,24 @@ mod tests {
             Some(Usage {
                 session: 0.50,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.98, // enabled but weekly-exhausted
+                weekly_all: 0.98,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.01, // ample headroom + soonest reset — but disabled, so not viable
+                weekly_all: 0.01,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100),
                 session_resets_at: None,
             }),
@@ -857,6 +951,8 @@ mod tests {
         Some(Usage {
             session,
             weekly,
+            weekly_all: weekly,
+            weekly_scoped: None,
             weekly_resets_at,
             session_resets_at: None,
         })

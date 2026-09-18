@@ -727,6 +727,11 @@ fn append_sample_for_poll(
         reading.usage.weekly_resets_at,
     )
     .with_severity(reading.severity.clone())
+    .with_weekly_breakdown(
+        Some(reading.usage.weekly_all),
+        reading.usage.weekly_scoped,
+        reading.weekly_scoped_model.clone(),
+    )
     .with_spend(None);
     if let Err(err) = append_sample(samples_path, &sample) {
         eprintln!("sessiometer: usage-sample write skipped: {err}");
@@ -6329,6 +6334,8 @@ mod tests {
                 Scripted::Ok(Usage {
                     session,
                     weekly,
+                    weekly_all: weekly,
+                    weekly_scoped: None,
                     weekly_resets_at: None,
                     session_resets_at: None,
                 }),
@@ -6350,6 +6357,8 @@ mod tests {
                 Scripted::Ok(Usage {
                     session,
                     weekly,
+                    weekly_all: weekly,
+                    weekly_scoped: None,
                     weekly_resets_at: Some(weekly_resets_at),
                     session_resets_at: None,
                 }),
@@ -6371,6 +6380,8 @@ mod tests {
                 Scripted::Ok(Usage {
                     session,
                     weekly,
+                    weekly_all: weekly,
+                    weekly_scoped: None,
                     weekly_resets_at: None,
                     session_resets_at: Some(session_resets_at),
                 }),
@@ -6416,6 +6427,7 @@ mod tests {
                 Some(Scripted::Ok(usage)) => Ok(PolledReading {
                     usage: *usage,
                     severity: None,
+                    weekly_scoped_model: None,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
@@ -7146,6 +7158,8 @@ mod tests {
         Usage {
             session,
             weekly,
+            weekly_all: weekly,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         }
@@ -7198,6 +7212,8 @@ mod tests {
         Ok(Usage {
             session,
             weekly,
+            weekly_all: weekly,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         })
@@ -7221,6 +7237,7 @@ mod tests {
                 Some(Scripted::Ok(usage)) => Ok(PolledReading {
                     usage: *usage,
                     severity: None,
+                    weekly_scoped_model: None,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
@@ -7381,6 +7398,8 @@ mod tests {
         Some(Usage {
             session: 0.0,
             weekly: 0.99,
+            weekly_all: 0.99,
+            weekly_scoped: None,
             weekly_resets_at,
             session_resets_at: None,
         })
@@ -7448,6 +7467,8 @@ mod tests {
             Some(Usage {
                 session: 0.99,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: Some(500),
                 session_resets_at: Some(500),
             }),
@@ -7455,6 +7476,8 @@ mod tests {
             Some(Usage {
                 session: 0.90,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: Some(300),
             }),
@@ -7462,6 +7485,8 @@ mod tests {
             Some(Usage {
                 session: 0.85,
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: Some(150),
             }),
@@ -7489,6 +7514,8 @@ mod tests {
             Some(Usage {
                 session: 0.99,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: Some(9_000),
                 session_resets_at: Some(9_000),
             }),
@@ -7496,6 +7523,8 @@ mod tests {
             Some(Usage {
                 session: 0.0,
                 weekly: 0.98,
+                weekly_all: 0.98,
+                weekly_scoped: None,
                 weekly_resets_at: Some(3_600),
                 session_resets_at: None,
             }),
@@ -7503,6 +7532,8 @@ mod tests {
             Some(Usage {
                 session: 0.96,
                 weekly: 0.53,
+                weekly_all: 0.53,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: Some(10_800),
             }),
@@ -7528,6 +7559,8 @@ mod tests {
             Some(Usage {
                 session: 0.99,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: Some(9_000),
                 session_resets_at: Some(9_000),
             }),
@@ -7535,6 +7568,8 @@ mod tests {
             Some(Usage {
                 session: 0.90,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: Some(8_000),
                 session_resets_at: Some(1_000),
             }),
@@ -7542,6 +7577,8 @@ mod tests {
             Some(Usage {
                 session: 0.85,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: Some(5_000),
             }),
@@ -7575,6 +7612,8 @@ mod tests {
             Some(Usage {
                 session: 0.90,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: Some(4_000),
                 session_resets_at: Some(4_000),
             }),
@@ -8070,12 +8109,16 @@ mod tests {
             Some(Usage {
                 session: 0.10,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.85,
                 weekly: 0.975,
+                weekly_all: 0.975,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -8106,6 +8149,8 @@ mod tests {
             Some(Usage {
                 session,
                 weekly,
+                weekly_all: weekly,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             })
@@ -11353,6 +11398,8 @@ mod tests {
         readings[0] = Some(Usage {
             session,
             weekly: 0.20,
+            weekly_all: 0.20,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         });
@@ -11524,6 +11571,8 @@ mod tests {
         readings[0] = Some(Usage {
             session,
             weekly: 0.20,
+            weekly_all: 0.20,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: window,
         });
@@ -11538,6 +11587,8 @@ mod tests {
             &Usage {
                 session,
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: Some(WINDOW),
             },
@@ -11754,6 +11805,8 @@ mod tests {
                 &Usage {
                     session: 0.94,
                     weekly: 0.20,
+                    weekly_all: 0.20,
+                    weekly_scoped: None,
                     weekly_resets_at: None,
                     session_resets_at: Some(WINDOW)
                 }
@@ -11993,6 +12046,8 @@ mod tests {
         let stamped = |session: f64| Usage {
             session,
             weekly: 0.20,
+            weekly_all: 0.20,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: Some(WINDOW),
         };
@@ -12502,6 +12557,8 @@ mod tests {
         let reading = Usage {
             session: 0.10,
             weekly: 0.99,
+            weekly_all: 0.99,
+            weekly_scoped: None,
             weekly_resets_at: Some(now + 7_200),
             session_resets_at: None,
         };
@@ -12519,6 +12576,8 @@ mod tests {
         let reading = Usage {
             session: 0.10,
             weekly: 0.99,
+            weekly_all: 0.99,
+            weekly_scoped: None,
             weekly_resets_at: Some(now + 1_800),
             session_resets_at: None,
         };
@@ -12535,6 +12594,8 @@ mod tests {
         let imminent = Usage {
             session: 0.10,
             weekly: 0.99,
+            weekly_all: 0.99,
+            weekly_scoped: None,
             weekly_resets_at: Some(now + 10),
             session_resets_at: None,
         };
@@ -12547,6 +12608,8 @@ mod tests {
         let past = Usage {
             session: 0.10,
             weekly: 0.99,
+            weekly_all: 0.99,
+            weekly_scoped: None,
             weekly_resets_at: Some(now - 500),
             session_resets_at: None,
         };
@@ -12563,6 +12626,8 @@ mod tests {
         let reading = Usage {
             session: 0.10,
             weekly: 0.99,
+            weekly_all: 0.99,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -12581,6 +12646,8 @@ mod tests {
         let reading = Usage {
             session: 0.96,
             weekly: 0.10,
+            weekly_all: 0.10,
+            weekly_scoped: None,
             weekly_resets_at: Some(now + 100), // must be IGNORED — weekly is not exhausted
             session_resets_at: Some(now + 1_200),
         };
@@ -12598,6 +12665,8 @@ mod tests {
         let reading = Usage {
             session: 0.96,
             weekly: 0.99,
+            weekly_all: 0.99,
+            weekly_scoped: None,
             weekly_resets_at: Some(now + 900),
             session_resets_at: Some(now + 2_400),
         };
@@ -14523,6 +14592,8 @@ mod tests {
         let usage = |session: f64| Usage {
             session,
             weekly: 0.20,
+            weekly_all: 0.20,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -14639,6 +14710,8 @@ mod tests {
         let stale = Usage {
             session: 0.40,
             weekly: 0.20,
+            weekly_all: 0.20,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: Some(WINDOW),
         };
@@ -19678,10 +19751,13 @@ mod tests {
             usage: Usage {
                 session: 0.42,
                 weekly: 0.88,
+                weekly_all: 0.88,
+                weekly_scoped: None,
                 weekly_resets_at: Some(1_700_600_000),
                 session_resets_at: Some(1_700_003_600),
             },
             severity: Some("critical".to_owned()),
+            weekly_scoped_model: None,
         });
 
         append_sample_for_poll(&samples_path, "work", &reading, 1_700_000_000);
@@ -19728,10 +19804,13 @@ mod tests {
             usage: Usage {
                 session: 0.42,
                 weekly: 0.88,
+                weekly_all: 0.88,
+                weekly_scoped: None,
                 weekly_resets_at: Some(1_700_600_000),
                 session_resets_at: Some(1_700_003_600),
             },
             severity: Some("critical".to_owned()),
+            weekly_scoped_model: None,
         });
         let authored = "alice@example.com";
 
@@ -19766,10 +19845,13 @@ mod tests {
             usage: Usage {
                 session: 0.1,
                 weekly: 0.2,
+                weekly_all: 0.2,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             },
             severity: None,
+            weekly_scoped_model: None,
         });
 
         append_sample_for_poll(&samples_path, "spare", &reading, 42);
@@ -19803,10 +19885,13 @@ mod tests {
             usage: Usage {
                 session: 0.3,
                 weekly: 0.4,
+                weekly_all: 0.4,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             },
             severity: None,
+            weekly_scoped_model: None,
         });
         append_sample_for_poll(&samples_path, "work", &ok, 200);
         let transient: Result<PolledReading> = Err(Error::UsageTransient {
@@ -19838,10 +19923,13 @@ mod tests {
             usage: Usage {
                 session: 0.5,
                 weekly: 0.6,
+                weekly_all: 0.6,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             },
             severity: Some("warning".to_owned()),
+            weekly_scoped_model: None,
         });
 
         // Must NOT panic / unwind: reaching the assertion below proves the write

@@ -1134,6 +1134,8 @@ mod tests {
             Some(Usage {
                 session: 0.10,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -1178,6 +1180,8 @@ mod tests {
             Some(Usage {
                 session: 0.85,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -1217,12 +1221,16 @@ mod tests {
             Some(Usage {
                 session: 0.10,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -1509,6 +1517,8 @@ mod tests {
                 // Over the 98% weekly ceiling `tunables` configures → weekly-exhausted.
                 session: 0.10,
                 weekly: 0.99,
+                weekly_all: 0.99,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),

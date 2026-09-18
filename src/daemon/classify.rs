@@ -222,6 +222,8 @@ mod tests {
         Ok(Usage {
             session,
             weekly,
+            weekly_all: weekly,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         })
@@ -313,6 +315,8 @@ mod tests {
         let r = |session: f64, weekly: f64| Usage {
             session,
             weekly,
+            weekly_all: weekly,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         };

@@ -1122,6 +1122,8 @@ mod tests {
         let usage = Usage {
             session: 0.5,
             weekly: 0.5,
+            weekly_all: 0.5,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1136,6 +1138,8 @@ mod tests {
         let usage = Usage {
             session: 0.95,
             weekly: 0.1,
+            weekly_all: 0.1,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1148,6 +1152,8 @@ mod tests {
         let usage = Usage {
             session: 0.50,
             weekly: 0.98,
+            weekly_all: 0.98,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1164,6 +1170,8 @@ mod tests {
         let usage = Usage {
             session: 0.50,
             weekly: 0.96,
+            weekly_all: 0.96,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1560,6 +1568,8 @@ mod tests {
         Usage {
             session,
             weekly: 0.20,
+            weekly_all: 0.20,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: window,
         }

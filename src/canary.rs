@@ -935,10 +935,13 @@ mod tests {
                     usage: crate::usage::Usage {
                         session: 0.10,
                         weekly: 0.10,
+                        weekly_all: 0.10,
+                        weekly_scoped: None,
                         weekly_resets_at: None,
                         session_resets_at: None,
                     },
                     severity: None,
+                    weekly_scoped_model: None,
                 }),
                 Err(err) => Err(err),
             }

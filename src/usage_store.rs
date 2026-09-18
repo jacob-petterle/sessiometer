@@ -127,8 +127,9 @@ const STORE_LOCK_RETRY: Duration = Duration::from_millis(20);
 /// operator-authored email permitted since #444/#447, an unauthored email or a token
 /// never — see the module's redaction note), and every other field is a non-secret
 /// percentage, timestamp or label — so `Debug` is safe here (contrast the
-/// credential-bearing types that omit it). The four optional fields are omitted from
-/// the JSON entirely when absent, keeping each line minimal.
+/// credential-bearing types that omit it). The optional fields are omitted from
+/// the JSON entirely when absent, keeping each line minimal — and letting lines
+/// written by an older daemon (which lack the weekly breakdown) still parse.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Sample {
     /// When the reading was taken, as whole UTC epoch seconds.
@@ -144,8 +145,22 @@ pub(crate) struct Sample {
     /// Fraction in `[0.0, …]` of the rolling 5-hour session window consumed
     /// (`1.0` = exhausted; readings can exceed it).
     pub(crate) session: f64,
-    /// Fraction in `[0.0, …]` of the weekly window consumed.
+    /// Fraction in `[0.0, …]` of the weekly window consumed — the BINDING
+    /// reading (`max` of the all-models window and any active scoped cap).
     pub(crate) weekly: f64,
+    /// Fraction in `[0.0, …]` of the ALL-MODELS weekly window — the `seven_day`
+    /// reading before a `weekly_scoped` cap overrode `weekly`. Persisted so an
+    /// external reader can chart overall vs scoped weekly separately; `None` on
+    /// lines written before the breakdown was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly_all: Option<f64>,
+    /// The highest ACTIVE per-model `weekly_scoped` cap's fraction, when the
+    /// poll's response carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly_scoped: Option<f64>,
+    /// The scoped entry's model display name (e.g. `"Fable"`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly_scoped_model: Option<String>,
     /// Epoch seconds at which the SESSION window resets, when the poll knew it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_resets_at: Option<i64>,
@@ -166,7 +181,9 @@ pub(crate) struct Sample {
 impl Sample {
     /// A reading with the required core fields and no optionals. Chain
     /// [`with_resets`](Sample::with_resets) / [`with_severity`](Sample::with_severity)
-    /// / [`with_spend`](Sample::with_spend) to add the optional ones.
+    /// / [`with_spend`](Sample::with_spend) /
+    /// [`with_weekly_breakdown`](Sample::with_weekly_breakdown) to add the
+    /// optional ones.
     pub(crate) fn new(
         ts: i64,
         provider: impl Into<String>,
@@ -180,11 +197,30 @@ impl Sample {
             acct: acct.into(),
             session,
             weekly,
+            weekly_all: None,
+            weekly_scoped: None,
+            weekly_scoped_model: None,
             session_resets_at: None,
             weekly_resets_at: None,
             severity: None,
             spend: None,
         }
+    }
+
+    /// Attach the weekly breakdown: the all-models fraction plus, when the
+    /// response carried an active scoped cap, that cap's fraction and model
+    /// name. Each is optional — a sample built by an older reader (or from a
+    /// payload with no `limits[]` scoped entry) leaves them unset.
+    pub(crate) fn with_weekly_breakdown(
+        mut self,
+        weekly_all: Option<f64>,
+        weekly_scoped: Option<f64>,
+        weekly_scoped_model: Option<String>,
+    ) -> Self {
+        self.weekly_all = weekly_all;
+        self.weekly_scoped = weekly_scoped;
+        self.weekly_scoped_model = weekly_scoped_model;
+        self
     }
 
     /// Attach the two window reset timestamps (each optional).
@@ -868,7 +904,8 @@ mod tests {
         let full = sample(1_700_000_000, 0.42, 0.88)
             .with_resets(Some(1_700_003_600), Some(1_700_600_000))
             .with_severity(Some("critical".to_owned()))
-            .with_spend(Some(1.25));
+            .with_spend(Some(1.25))
+            .with_weekly_breakdown(Some(0.44), Some(0.74), Some("Fable".to_owned()));
         let restored: Sample =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert_eq!(restored, full);
@@ -877,9 +914,55 @@ mod tests {
         let bare = sample(1_700_000_000, 0.10, 0.20);
         let json = serde_json::to_string(&bare).unwrap();
         assert_eq!(serde_json::from_str::<Sample>(&json).unwrap(), bare);
-        for absent in ["session_resets_at", "weekly_resets_at", "severity", "spend"] {
+        for absent in [
+            "weekly_all",
+            "weekly_scoped",
+            "weekly_scoped_model",
+            "session_resets_at",
+            "weekly_resets_at",
+            "severity",
+            "spend",
+        ] {
             assert!(!json.contains(absent), "absent optional leaked: {json}");
         }
+    }
+
+    #[test]
+    fn a_legacy_line_without_the_weekly_breakdown_deserializes() {
+        // A line written by an older daemon carries no breakdown keys — it must
+        // still parse, with all three fields `None` (serde `default`).
+        let legacy =
+            r#"{"ts":1700000000,"provider":"claude","acct":"work","session":0.15,"weekly":0.03}"#;
+        let sample: Sample = serde_json::from_str(legacy).unwrap();
+        assert_eq!(sample.weekly_all, None);
+        assert_eq!(sample.weekly_scoped, None);
+        assert_eq!(sample.weekly_scoped_model, None);
+        assert_eq!(sample.weekly, 0.03);
+    }
+
+    #[test]
+    fn an_unset_weekly_breakdown_serializes_without_the_keys() {
+        // `weekly_scoped: None` (no scoped cap in the poll) omits the breakdown
+        // keys entirely rather than writing explicit nulls — the same
+        // `skip_serializing_if` discipline the other optionals follow.
+        let no_breakdown = sample(1_700_000_000, 0.10, 0.20);
+        let json = serde_json::to_string(&no_breakdown).unwrap();
+        for key in ["weekly_all", "weekly_scoped", "weekly_scoped_model"] {
+            assert!(!json.contains(key), "{key} should be omitted: {json}");
+        }
+        // A partial breakdown (all-models known, no scoped cap) still omits the
+        // scoped pair.
+        let partial =
+            sample(1_700_000_000, 0.10, 0.20).with_weekly_breakdown(Some(0.20), None, None);
+        let json = serde_json::to_string(&partial).unwrap();
+        assert!(
+            json.contains("\"weekly_all\":0.2"),
+            "weekly_all present: {json}"
+        );
+        assert!(
+            !json.contains("weekly_scoped"),
+            "scoped keys omitted: {json}"
+        );
     }
 
     #[test]

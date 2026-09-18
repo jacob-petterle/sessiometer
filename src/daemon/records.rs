@@ -834,6 +834,8 @@ mod tests {
             &Usage {
                 session: BLIND_GATE_RISK_BAND + 0.10,
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: Some(WINDOW),
             },
@@ -910,6 +912,8 @@ mod tests {
             &Usage {
                 session: BLIND_GATE_RISK_BAND - 0.10, // 0.50, the corrected base — below the band
                 weekly: 0.20,
+                weekly_all: 0.20,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: Some(WINDOW),
             },

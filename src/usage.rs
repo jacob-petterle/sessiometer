@@ -87,8 +87,21 @@ const POLL_TIMEOUT_SECS: u32 = 30;
 pub(crate) struct Usage {
     /// Fraction in `[0.0, 1.0]` of the rolling 5-hour session window consumed.
     pub(crate) session: f64,
-    /// Fraction in `[0.0, 1.0]` of the weekly window consumed.
+    /// Fraction in `[0.0, 1.0]` of the weekly window consumed — the BINDING
+    /// reading: the all-models `weekly_all`, or an active per-model
+    /// `weekly_scoped` cap when that sits higher.
     pub(crate) weekly: f64,
+    /// Fraction in `[0.0, 1.0]` of the ALL-MODELS weekly window consumed — the
+    /// `seven_day` reading BEFORE any `weekly_scoped` override. Kept beside
+    /// `weekly` so the sample store can persist the overall-vs-scoped split for
+    /// external readers.
+    pub(crate) weekly_all: f64,
+    /// The highest ACTIVE per-model `weekly_scoped` cap's fraction, when the
+    /// response carried one; `None` when no active scoped entry exists (so the
+    /// reading is all-models only). The cap's model name rides the sample-only
+    /// channel instead ([`PolledReading::weekly_scoped_model`]) — an owned
+    /// `String` here would cost `Usage` its `Copy`.
+    pub(crate) weekly_scoped: Option<f64>,
     /// Epoch seconds at which the WEEKLY window resets, when the API reported a
     /// parseable timestamp; `None` otherwise. The all-exhausted terminal logic
     /// (issue #11) consumes it: when every account is weekly-exhausted the daemon
@@ -124,6 +137,11 @@ pub(crate) struct PolledReading {
     /// ([`crate::usage_store::Sample`]); a tolerant free string, never parsed to an
     /// enum, so an unrecognised future value is retained rather than dropped.
     pub(crate) severity: Option<String>,
+    /// The winning `weekly_scoped` entry's `scope.model.display_name` (e.g.
+    /// `"Fable"`), when the response named one — persisted to the sample store
+    /// alongside [`Usage::weekly_scoped`]. Kept here rather than on [`Usage`] so
+    /// the pervasive `Copy` decision type carries no owned `String`.
+    pub(crate) weekly_scoped_model: Option<String>,
 }
 
 /// The full parse of a usage response: both dimensions plus each window's reset
@@ -137,6 +155,16 @@ pub(crate) struct PolledReading {
 struct UsageReport {
     session: f64,
     weekly: f64,
+    /// The ALL-MODELS weekly fraction — what `dimension("seven_day", …)` read
+    /// BEFORE a higher `weekly_scoped` cap overrode `weekly`. Kept verbatim so
+    /// the sample store can persist the overall-vs-scoped split.
+    weekly_all: f64,
+    /// The highest ACTIVE `weekly_scoped` entry's fraction, `None` when the
+    /// response carried no active scoped cap.
+    weekly_scoped: Option<f64>,
+    /// That scoped entry's `scope.model.display_name` (e.g. `"Fable"`), `None`
+    /// when the scope or name is missing.
+    weekly_scoped_model: Option<String>,
     /// Raw `resets_at` of the session window, as the API rendered it (ISO string
     /// or epoch-as-string); tolerant — `None` if absent/unrecognized. Projected to
     /// epoch seconds by [`to_usage`](UsageReport::to_usage) for the `status`
@@ -166,6 +194,8 @@ impl UsageReport {
         Usage {
             session: self.session,
             weekly: self.weekly,
+            weekly_all: self.weekly_all,
+            weekly_scoped: self.weekly_scoped,
             weekly_resets_at: self
                 .weekly_resets_at
                 .as_deref()
@@ -249,6 +279,7 @@ where
                 Ok(PolledReading {
                     usage: report.to_usage(),
                     severity: report.severity(),
+                    weekly_scoped_model: report.weekly_scoped_model.clone(),
                 })
             }
             UsageStatus::ScopeMissing => Err(Error::UsageScopeMissing),
@@ -450,23 +481,33 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
     let (session, session_resets_at, session_severity) =
         dimension(&root, "five_hour", &["session", "five_hour"])
             .ok_or_else(|| Error::UsageParse("no session (five_hour) dimension".into()))?;
-    let (mut weekly, mut weekly_resets_at, mut weekly_severity) =
+    let (weekly_all, mut weekly_resets_at, mut weekly_severity) =
         dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"])
             .ok_or_else(|| Error::UsageParse("no weekly (seven_day) dimension".into()))?;
+    let mut weekly = weekly_all;
 
     // A per-model `weekly_scoped` cap above the all-models window is the binding
-    // constraint — take it over the top-level `seven_day` reading.
-    if let Some((fraction, resets_at, severity)) = max_active_weekly_scoped(&root) {
-        if fraction > weekly {
-            weekly = fraction;
-            weekly_resets_at = resets_at;
-            weekly_severity = severity;
+    // constraint — take it over the top-level `seven_day` reading. Either way the
+    // breakdown is recorded: `weekly_all` keeps the pre-override all-models
+    // fraction and the scoped fields carry the cap + its model name.
+    let mut weekly_scoped = None;
+    let mut weekly_scoped_model = None;
+    if let Some(scoped) = max_active_weekly_scoped(&root) {
+        weekly_scoped = Some(scoped.fraction);
+        weekly_scoped_model = scoped.model;
+        if scoped.fraction > weekly {
+            weekly = scoped.fraction;
+            weekly_resets_at = scoped.resets_at;
+            weekly_severity = scoped.severity;
         }
     }
 
     Ok(UsageReport {
         session,
         weekly,
+        weekly_all,
+        weekly_scoped,
+        weekly_scoped_model,
         session_resets_at,
         weekly_resets_at,
         session_severity,
@@ -519,7 +560,23 @@ fn dimension(
     fallback
 }
 
-/// The highest `(fraction, resets_at, severity)` among `limits[]` entries with
+/// One active `limits[]` entry of `kind == "weekly_scoped"` — a per-model weekly
+/// cap — distilled to what [`parse_usage`] needs. Named fields rather than a
+/// four-element tuple, so the three optional strings (`resets_at` / `severity` /
+/// `model`) cannot be confused positionally.
+struct WeeklyScoped {
+    /// Fraction in `[0.0, 1.0]` of the scoped weekly cap consumed.
+    fraction: f64,
+    /// Raw `resets_at` as the API rendered it (see [`UsageReport::weekly_resets_at`]).
+    resets_at: Option<String>,
+    /// The entry's provider `severity` label, when present.
+    severity: Option<String>,
+    /// `scope.model.display_name` (e.g. `"Fable"`), `None` when the scope or the
+    /// name is absent — a scoped cap with no model name still counts.
+    model: Option<String>,
+}
+
+/// The highest [`WeeklyScoped`] among `limits[]` entries with
 /// `kind == "weekly_scoped"` that are active (`is_active` true or absent; an
 /// explicit `false` is skipped — unlike [`dimension`]'s inactive fallback, a
 /// scoped cap the API has switched off must never outvote the all-models
@@ -528,9 +585,9 @@ fn dimension(
 /// Fable-heavy account can sit at 44 % overall while its Fable cap is already at
 /// 74 %, and it is the 74 % that exhausts the account. `None` when no active
 /// scoped entry carries a readable fraction.
-fn max_active_weekly_scoped(root: &Value) -> Option<(f64, Option<String>, Option<String>)> {
+fn max_active_weekly_scoped(root: &Value) -> Option<WeeklyScoped> {
     let limits = root.get("limits").and_then(Value::as_array)?;
-    let mut max: Option<(f64, Option<String>, Option<String>)> = None;
+    let mut max: Option<WeeklyScoped> = None;
     for entry in limits {
         let kind = entry.get("kind").and_then(Value::as_str);
         if kind != Some("weekly_scoped") {
@@ -546,11 +603,28 @@ fn max_active_weekly_scoped(root: &Value) -> Option<(f64, Option<String>, Option
         let Some(fraction) = fraction_of(entry) else {
             continue;
         };
-        if max.as_ref().is_none_or(|(best, _, _)| fraction > *best) {
-            max = Some((fraction, resets_at_of(entry), severity_of(entry)));
+        if max.as_ref().is_none_or(|best| fraction > best.fraction) {
+            max = Some(WeeklyScoped {
+                fraction,
+                resets_at: resets_at_of(entry),
+                severity: severity_of(entry),
+                model: scoped_model_of(entry),
+            });
         }
     }
     max
+}
+
+/// The scoped model's display name from a `limits[]` entry —
+/// `scope.model.display_name`; `None` when the scope, the model object, or the
+/// name itself is absent or not a string.
+fn scoped_model_of(entry: &Value) -> Option<String> {
+    entry
+        .get("scope")?
+        .get("model")?
+        .get("display_name")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Read a usage fraction in `[0.0, 1.0]` from an object: a `utilization`
@@ -876,6 +950,11 @@ mod tests {
         }"#;
         let report = parse_usage(body).unwrap();
         assert!((report.weekly - 0.74).abs() < 1e-9);
+        // The breakdown keeps the pre-override all-models reading alongside the
+        // winning scoped cap + its model name, so a consumer can chart the split.
+        assert!((report.weekly_all - 0.44).abs() < 1e-9);
+        assert_eq!(report.weekly_scoped, Some(0.74));
+        assert_eq!(report.weekly_scoped_model.as_deref(), Some("Fable"));
         assert_eq!(
             report.weekly_resets_at.as_deref(),
             Some("2026-09-24T16:00:00.485335+00:00")
@@ -937,6 +1016,10 @@ mod tests {
         }"#;
         let report = parse_usage(body).unwrap();
         assert!((report.weekly - 0.44).abs() < 1e-9);
+        // No `limits[]` → no scoped breakdown: `weekly_all` mirrors `weekly`.
+        assert_eq!(report.weekly_scoped, None);
+        assert_eq!(report.weekly_scoped_model, None);
+        assert!((report.weekly_all - 0.44).abs() < 1e-9);
         assert_eq!(
             report.weekly_resets_at.as_deref(),
             Some("2026-09-24T16:00:00.485164+00:00")
@@ -1139,6 +1222,9 @@ mod tests {
         let report = UsageReport {
             session: 0.1,
             weekly: 0.2,
+            weekly_all: 0.2,
+            weekly_scoped: None,
+            weekly_scoped_model: None,
             session_resets_at: Some("2025-01-01T00:00:00Z".to_owned()),
             weekly_resets_at: Some("2025-06-26T18:00:00Z".to_owned()),
             session_severity: None,

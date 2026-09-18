@@ -668,6 +668,8 @@ mod tests {
                     usage: Some(Usage {
                         session: 0.97,
                         weekly: 0.40,
+                        weekly_all: 0.40,
+                        weekly_scoped: None,
                         weekly_resets_at: None,
                         session_resets_at: None,
                     }),
@@ -1857,6 +1859,8 @@ mod tests {
         daemon.state.accounts[0].last_reading = Some(Usage {
             session: 0.10,
             weekly: 0.10,
+            weekly_all: 0.10,
+            weekly_scoped: None,
             weekly_resets_at: None,
             session_resets_at: None,
         });
@@ -3144,6 +3148,8 @@ mod tests {
                 usage: Some(Usage {
                     session: 0.50,
                     weekly: 0.25,
+                    weekly_all: 0.25,
+                    weekly_scoped: None,
                     weekly_resets_at: None,
                     session_resets_at: None,
                 }),
@@ -3322,6 +3328,8 @@ mod tests {
                 usage: Some(Usage {
                     session,
                     weekly: 0.10,
+                    weekly_all: 0.10,
+                    weekly_scoped: None,
                     weekly_resets_at: None,
                     session_resets_at: None,
                 }),
@@ -3785,6 +3793,8 @@ mod tests {
             usage: Some(Usage {
                 session: 0.60,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -5128,24 +5138,32 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(100), // soonest overall — but it is the active account
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.50, // below the 0.80 floor -> viable
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(200), // soonest among the viable -> the target
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(300),
                 session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10, // also viable…
                 weekly: 0.10,
+                weekly_all: 0.10,
+                weekly_scoped: None,
                 weekly_resets_at: Some(500), // …but a later reset, so never the target
                 session_resets_at: None,
             }),
@@ -5233,18 +5251,24 @@ mod tests {
                 Some(Usage {
                     session: 0.97,
                     weekly: 0.10,
+                    weekly_all: 0.10,
+                    weekly_scoped: None,
                     weekly_resets_at: Some(100), // soonest overall — but it is the active account
                     session_resets_at: None,
                 }),
                 Some(Usage {
                     session: 0.50, // below the 0.80 floor -> viable
                     weekly: 0.10,
+                    weekly_all: 0.10,
+                    weekly_scoped: None,
                     weekly_resets_at: Some(200), // tied…
                     session_resets_at: None,
                 }),
                 Some(Usage {
                     session: 0.50, // also viable…
                     weekly: 0.10,
+                    weekly_all: 0.10,
+                    weekly_scoped: None,
                     weekly_resets_at: Some(200), // …tied, so the tie-break decides
                     session_resets_at: None,
                 }),
@@ -5447,6 +5471,8 @@ mod tests {
             Some(Usage {
                 session,
                 weekly,
+                weekly_all: weekly,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             })
@@ -5540,6 +5566,8 @@ mod tests {
             Some(Usage {
                 session,
                 weekly,
+                weekly_all: weekly,
+                weekly_scoped: None,
                 weekly_resets_at: None,
                 session_resets_at: None,
             })
