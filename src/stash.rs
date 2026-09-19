@@ -124,10 +124,11 @@ impl RealAccountStash {
     }
 
     /// `add-generic-password -U` one item, storing `payload` as the secret —
-    /// driven through `security -i` (the command on stdin) so `payload` never
-    /// reaches this process's argv (issue #39). This matters most for the
-    /// `oauthAccount` half, whose hex carries the account's email: the previously
-    /// accepted argv exposure (wider than #2's opaque-token case) is now closed.
+    /// driven through `security -i` (the command on stdin) while the line fits
+    /// its 4 KiB buffer so `payload` stays off this process's argv (issue #39),
+    /// spelled on argv past it (the argv form has no line-length bound). The
+    /// stdin transport matters most for the `oauthAccount` half, whose hex
+    /// carries the account's email.
     async fn add_item(
         &self,
         service: &str,
@@ -135,10 +136,10 @@ impl RealAccountStash {
         keychain: &Path,
         payload: &[u8],
     ) -> Result<()> {
-        // `line` (the command, payload included) is the only heap copy of the
-        // escaped secret and is `Zeroizing`; only `-i` ever reaches argv.
-        let line = write_item_command_line(service, acct, keychain, payload)?;
-        let output = run_interactive_write(&line).await?;
+        // `run_write` builds the line (payload included) and picks the transport
+        // by size; under 4 KiB `line` is the only heap copy of the escaped secret
+        // and is `Zeroizing`.
+        let output = run_write(service, acct, keychain, payload).await?;
         if output.status.success() {
             Ok(())
         } else {
@@ -313,7 +314,9 @@ fn keychain_path_bytes(keychain: &Path) -> Result<&[u8]> {
 /// The `security -i` stdin line for one stash write: an in-place (`-U`)
 /// `add-generic-password` of `(service, acct)`, pinning the keychain, every field
 /// double-quoted (incl. the payload). Fed on stdin so the payload stays off argv
-/// (issue #39). The returned buffer holds the secret, so it is `Zeroizing`.
+/// (issue #39) whenever the line fits the interactive reader's
+/// [`INTERACTIVE_LINE_MAX`] buffer. The returned buffer holds the secret, so it
+/// is `Zeroizing`.
 fn write_item_command_line(
     service: &str,
     acct: &str,
@@ -349,8 +352,11 @@ fn write_item_command_line(
 
 /// Run one off-argv write: spawn `security -i` (argv is only `-i` — the payload
 /// rides stdin, never the process command line, issue #39), feed `line`, close
-/// stdin so the CLI hits EOF and exits, and collect the result. Mirrors
-/// [`crate::keychain`]'s helper, kept local to avoid coupling the two modules.
+/// stdin so the CLI hits EOF and exits, and collect the result. This is the
+/// [`WriteTransport::Interactive`] arm — for lines under
+/// [`INTERACTIVE_LINE_MAX`]; larger writes take the argv arm in [`run_write`].
+/// Mirrors [`crate::keychain`]'s helper, kept local to avoid coupling the two
+/// modules.
 async fn run_interactive_write(line: &[u8]) -> Result<std::process::Output> {
     use tokio::io::AsyncWriteExt;
     let mut child = Command::new(SECURITY)
@@ -368,6 +374,93 @@ async fn run_interactive_write(line: &[u8]) -> Result<std::process::Output> {
         .write_all(line)
         .await?;
     Ok(child.wait_with_output().await?)
+}
+
+/// `security -i` reads its command through a 4 KiB line buffer; a line at or
+/// past it exits 1 without writing. The credential blob can exceed that — Claude
+/// Code stores `mcpOAuth` discovery state in the item, one entry per configured
+/// MCP server, taking it to ~9 KB — so writes that large go through the argv
+/// form of the same `add-generic-password` command, which has no such bound (at
+/// the cost of the payload sitting on the spawned child's argv, which issue #39
+/// otherwise avoids). Mirrors [`crate::keychain`]'s constant, kept local to
+/// avoid coupling the two keychain modules.
+const INTERACTIVE_LINE_MAX: usize = 4096;
+
+/// How one write's command reaches `security`.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteTransport {
+    /// The command line on `security -i` stdin — the payload stays off argv.
+    Interactive,
+    /// `security add-generic-password -U …` spelled on argv — unbounded, but the
+    /// payload is visible on the child's command line.
+    Argv,
+}
+
+/// Pick the transport for one write by its rendered command-line length.
+fn write_transport(line_len: usize) -> WriteTransport {
+    if line_len < INTERACTIVE_LINE_MAX {
+        WriteTransport::Interactive
+    } else {
+        WriteTransport::Argv
+    }
+}
+
+/// `payload` as the `OsStr` argv token for the [`WriteTransport::Argv`] write —
+/// per-target, for the same reason as [`keychain_path_bytes`]: argv is a byte
+/// stream on Unix and UTF-16 on Windows. The Unix arm is byte-exact
+/// (`OsStr::from_bytes`, infallible); the Windows arm is lossless-or-refuses.
+#[cfg(unix)]
+fn payload_arg(payload: &[u8]) -> Result<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::ffi::OsStr::from_bytes(payload).to_owned())
+}
+
+/// See the `#[cfg(unix)]` sibling for the contract; this is the lossless-or-refuse arm.
+#[cfg(windows)]
+fn payload_arg(payload: &[u8]) -> Result<OsString> {
+    std::str::from_utf8(payload)
+        .map(OsString::from)
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the payload is not valid UTF-8 and cannot be encoded for a `security` argv \
+             without loss",
+            ))
+        })
+}
+
+/// Run one write through whichever transport the rendered line's size admits
+/// ([`write_transport`]): the off-argv `security -i` path when the line fits the
+/// 4 KiB buffer, or the same `add-generic-password` spelled on argv when it does
+/// not. Returns the child's output for the caller's error mapping. Mirrors
+/// [`crate::keychain`]'s helper, kept local to avoid coupling the two modules.
+async fn run_write(
+    service: &str,
+    acct: &str,
+    keychain: &Path,
+    payload: &[u8],
+) -> Result<std::process::Output> {
+    let line = write_item_command_line(service, acct, keychain, payload)?;
+    match write_transport(line.len()) {
+        WriteTransport::Interactive => run_interactive_write(&line).await,
+        WriteTransport::Argv => Ok(Command::new(SECURITY)
+            .args([
+                OsString::from("add-generic-password"),
+                OsString::from("-U"),
+                OsString::from("-s"),
+                OsString::from(service),
+                OsString::from("-a"),
+                OsString::from(acct),
+                OsString::from("-w"),
+                payload_arg(payload)?,
+                keychain.as_os_str().to_owned(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await?),
+    }
 }
 
 /// `find-generic-password` arguments (after the program name): read the secret of
@@ -489,6 +582,15 @@ mod tests {
         let mut out = Vec::new();
         push_quoted(&mut out, b"a b$c`d;e|f&g");
         assert_eq!(out, b"\"a b$c`d;e|f&g\"");
+    }
+
+    #[test]
+    fn write_transport_splits_at_the_interactive_line_max() {
+        // Under the 4 KiB buffer → off-argv `security -i`; at or past it → argv.
+        assert_eq!(write_transport(0), WriteTransport::Interactive);
+        assert_eq!(write_transport(4095), WriteTransport::Interactive);
+        assert_eq!(write_transport(4096), WriteTransport::Argv);
+        assert_eq!(write_transport(9000), WriteTransport::Argv);
     }
 
     #[test]
@@ -798,6 +900,43 @@ mod tests {
             stash.write(service, &account).await.expect("write stash");
             let got = stash.read(service).await.expect("read stash");
             assert_eq!(got.credential.expose(), blob);
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn write_then_read_round_trips_a_payload_past_the_interactive_line_max() {
+            // A credential blob of 9000 bytes — the size the canonical item
+            // reaches once Claude Code stores `mcpOAuth` discovery state in it —
+            // renders a `security -i` command line well past the 4 KiB buffer, so
+            // the write rides the argv arm. Both halves round-trip byte-exact.
+            let (_dir, kc) = fresh_keychain();
+            let stash = RealAccountStash::for_keychain(kc.clone());
+            let service = "Sessiometer/44444444-4444-4444-4444-444444444444";
+            let mut blob =
+                br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-EXAMPLE"},"mcpOAuth":""#.to_vec();
+            blob.extend_from_slice(&vec![b'x'; 9000 - blob.len() - 1]);
+            blob.push(b'}');
+            assert_eq!(blob.len(), 9000);
+            assert!(!blob.contains(&b'\n'), "the blob is single-line");
+            let line = write_item_command_line(service, ACCT_CREDENTIAL, &kc, &blob).unwrap();
+            assert!(
+                line.len() >= INTERACTIVE_LINE_MAX,
+                "sanity: this fixture exercises the argv arm"
+            );
+            let account = StashedAccount {
+                credential: Credential::new(blob),
+                oauth_account: OauthAccount::from_object_bytes(
+                    br#"{"accountUuid":"44444444-4444-4444-4444-444444444444"}"#,
+                )
+                .unwrap(),
+            };
+            stash.write(service, &account).await.expect("write stash");
+            let got = stash.read(service).await.expect("read stash");
+            assert_eq!(got.credential.expose(), account.credential.expose());
+            assert_eq!(
+                got.oauth_account.account_uuid(),
+                "44444444-4444-4444-4444-444444444444"
+            );
             delete(&kc);
         }
     }

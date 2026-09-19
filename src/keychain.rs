@@ -58,8 +58,10 @@
 //!     `-w` prints the secret with a single trailing newline, which [`finish_read`]
 //!     strips so a read→write round-trip is byte-exact.
 //!   - **write** — `add-generic-password -U -s <service> -a <resolved-acct> -w <blob> <keychain>`,
-//!     fed to `security -i` on **stdin** (not argv) so the blob is never visible in
-//!     this process's command line (issue #39; `build/version-compat.md`).
+//!     fed to `security -i` on **stdin** while the line fits its 4 KiB buffer so
+//!     the blob stays off this process's command line (issue #39;
+//!     `build/version-compat.md`); past that bound — Claude Code's `mcpOAuth`
+//!     state can take the item to ~9 KB — the same command is spelled on argv.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -613,7 +615,9 @@ fn push_quoted(out: &mut Vec<u8>, token: &[u8]) {
 /// (`-U`) `add-generic-password` of the resolved item, every field double-quoted
 /// (incl. the blob). Feeding this on stdin keeps the blob off this process's argv
 /// — the spawned `security` carries only `-i` — closing the #2 residual risk
-/// (issue #39). The returned buffer holds the secret, so it is `Zeroizing`.
+/// (issue #39) whenever the line fits the interactive reader's
+/// [`INTERACTIVE_LINE_MAX`] buffer. The returned buffer holds the secret, so it
+/// is `Zeroizing`.
 fn write_command_line(
     service: &str,
     acct: &OsStr,
@@ -644,7 +648,9 @@ fn write_command_line(
 /// Run one off-argv write: spawn `security -i` (argv is only `-i` — the blob
 /// rides stdin, never the process command line, issue #39), feed `line`, then
 /// close stdin so the CLI hits EOF and exits, and collect the result. `line`
-/// holds the secret and stays owned (and `Zeroizing`) at the call site.
+/// holds the secret and stays owned (and `Zeroizing`) at the call site. This is
+/// the [`WriteTransport::Interactive`] arm — for lines under
+/// [`INTERACTIVE_LINE_MAX`]; larger writes take the argv arm in [`run_write`].
 async fn run_interactive_write(line: &[u8]) -> Result<std::process::Output> {
     use tokio::io::AsyncWriteExt;
     let mut child = Command::new(SECURITY)
@@ -668,6 +674,67 @@ async fn run_interactive_write(line: &[u8]) -> Result<std::process::Output> {
         .write_all(line)
         .await?;
     Ok(child.wait_with_output().await?)
+}
+
+/// `security -i` reads its command through a 4 KiB line buffer; a line at or
+/// past it exits 1 without writing. Claude Code stores `mcpOAuth` discovery
+/// state in the credential item — one entry per configured MCP server — which
+/// can take the blob to ~9 KB, so writes that large go through the argv form of
+/// the same `add-generic-password` command, which has no such bound (at the cost
+/// of the blob sitting on the spawned child's argv, which issue #39 otherwise
+/// avoids).
+const INTERACTIVE_LINE_MAX: usize = 4096;
+
+/// How one write's command reaches `security`.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteTransport {
+    /// The command line on `security -i` stdin — the blob stays off argv.
+    Interactive,
+    /// `security add-generic-password -U …` spelled on argv — unbounded, but the
+    /// blob is visible on the child's command line.
+    Argv,
+}
+
+/// Pick the transport for one write by its rendered command-line length.
+fn write_transport(line_len: usize) -> WriteTransport {
+    if line_len < INTERACTIVE_LINE_MAX {
+        WriteTransport::Interactive
+    } else {
+        WriteTransport::Argv
+    }
+}
+
+/// Run one write through whichever transport the rendered line's size admits
+/// ([`write_transport`]): the off-argv `security -i` path when the line fits the
+/// 4 KiB buffer, or the same `add-generic-password` spelled on argv when it does
+/// not. Returns the child's output for the caller's [`finish_write`] handling.
+async fn run_write(
+    service: &str,
+    acct: &OsStr,
+    keychain: &Path,
+    blob: &[u8],
+) -> Result<std::process::Output> {
+    let line = write_command_line(service, acct, keychain, blob);
+    match write_transport(line.len()) {
+        WriteTransport::Interactive => run_interactive_write(&line).await,
+        WriteTransport::Argv => Ok(Command::new(SECURITY)
+            .args([
+                OsStr::new("add-generic-password"),
+                OsStr::new("-U"),
+                OsStr::new("-s"),
+                OsStr::new(service),
+                OsStr::new("-a"),
+                acct,
+                OsStr::new("-w"),
+                OsStr::from_bytes(blob),
+                keychain.as_os_str(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await?),
+    }
 }
 
 /// Map a non-zero `security` exit `code` to a typed error. `36` is
@@ -957,11 +1024,11 @@ impl CredentialStore for RealCredentialStore {
     async fn write(&self, credential: &Credential) -> Result<()> {
         let acct = self.acct().await?;
         let keychain = self.keychain_path()?;
-        // Build the command (blob included) and feed it to `security -i` on
-        // stdin, so the blob never lands on this process's argv (issue #39).
-        // `line` is the only heap copy of the escaped secret and is `Zeroizing`.
-        let line = write_command_line(self.service()?, &acct, &keychain, credential.expose());
-        let output = run_interactive_write(&line).await?;
+        // `run_write` builds the command (blob included) and picks the transport
+        // by its size: `security -i` stdin while it fits the 4 KiB line buffer —
+        // `line` is then the only heap copy of the escaped secret and is
+        // `Zeroizing` — argv past it (issue #39).
+        let output = run_write(self.service()?, &acct, &keychain, credential.expose()).await?;
         finish_write(output.status.success(), output.status.code().unwrap_or(-1))
     }
 
@@ -1117,8 +1184,8 @@ impl CredentialStore for FakeCredentialStore {
 #[allow(dead_code)]
 pub(crate) trait IsolatedKeychain {
     /// Seed the isolated item with `blob` — `add-generic-password -U` fed to
-    /// `security -i` on stdin, so the blob never lands on this process's argv (#39),
-    /// under the `apple-tool:` identity (#101 AC-2).
+    /// `security -i` on stdin while the line fits its 4 KiB buffer (argv past
+    /// it, #39), under the `apple-tool:` identity (#101 AC-2).
     async fn seed(&self, blob: &[u8]) -> Result<()>;
     /// Read the (CC-refreshed) blob back — `find-generic-password -w`, silent under
     /// the preserved `apple-tool:` partition (#101 AC-2).
@@ -1133,9 +1200,10 @@ pub(crate) trait IsolatedKeychain {
 }
 
 /// Real isolated keychain item, driving `/usr/bin/security` against the login
-/// keychain (issue #102). Reuses the canonical item's off-argv `security -i` write
-/// and `-w` read primitives, addressing the config-dir-suffixed service under the
-/// `acct` CC itself would derive.
+/// keychain (issue #102). Reuses the canonical item's size-gated write
+/// (`security -i` stdin under 4 KiB, argv past it) and `-w` read primitives,
+/// addressing the config-dir-suffixed service under the `acct` CC itself would
+/// derive.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct IsolatedKeychainItem {
     /// The config-dir-suffixed service ([`service_for_config_dir`]) of the spawned
@@ -1232,8 +1300,7 @@ impl IsolatedKeychainItem {
 impl IsolatedKeychain for IsolatedKeychainItem {
     async fn seed(&self, blob: &[u8]) -> Result<()> {
         let keychain = self.keychain_path()?;
-        let line = write_command_line(&self.service, self.acct.as_os_str(), &keychain, blob);
-        let output = run_interactive_write(&line).await?;
+        let output = run_write(&self.service, self.acct.as_os_str(), &keychain, blob).await?;
         finish_write(output.status.success(), output.status.code().unwrap_or(-1))
     }
 
@@ -1833,6 +1900,15 @@ mod tests {
             kc.display()
         );
         assert_eq!(&line[..], expected.as_bytes());
+    }
+
+    #[test]
+    fn write_transport_splits_at_the_interactive_line_max() {
+        // Under the 4 KiB buffer → off-argv `security -i`; at or past it → argv.
+        assert_eq!(write_transport(0), WriteTransport::Interactive);
+        assert_eq!(write_transport(4095), WriteTransport::Interactive);
+        assert_eq!(write_transport(4096), WriteTransport::Argv);
+        assert_eq!(write_transport(9000), WriteTransport::Argv);
     }
 
     #[test]
@@ -2588,6 +2664,40 @@ class: "genp"
                 .expect("write a blob with metacharacters");
             let got = store.read().await.expect("read it back");
             assert_eq!(got.expose(), nasty);
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn write_round_trips_a_blob_past_the_interactive_line_max() {
+            // A 9000-byte blob — the size the canonical item reaches once Claude
+            // Code stores `mcpOAuth` discovery state in it — renders a
+            // `security -i` command line past the 4 KiB buffer, so the write rides
+            // the argv arm. Round-trips byte-exact through the real CLI.
+            let (_dir, kc) = fresh_keychain();
+            seed(&kc, "sessiometer-meta-acct", "seed-token");
+            let store = RealCredentialStore::for_keychain(kc.clone());
+            let mut blob =
+                br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-EXAMPLE"},"mcpOAuth":""#.to_vec();
+            blob.extend_from_slice(&vec![b'x'; 9000 - blob.len() - 1]);
+            blob.push(b'}');
+            assert_eq!(blob.len(), 9000);
+            assert!(!blob.contains(&b'\n'), "the blob is single-line");
+            let line = write_command_line(
+                SERVICE_BASE,
+                OsStr::new("sessiometer-meta-acct"),
+                &kc,
+                &blob,
+            );
+            assert!(
+                line.len() >= INTERACTIVE_LINE_MAX,
+                "sanity: this fixture exercises the argv arm"
+            );
+            store
+                .write(&Credential::new(blob.clone()))
+                .await
+                .expect("write a blob past the interactive line max");
+            let got = store.read().await.expect("read it back");
+            assert_eq!(got.expose(), &blob[..]);
             delete(&kc);
         }
 
