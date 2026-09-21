@@ -26,10 +26,13 @@ impl Config {
 
         range("session_ceiling", t.session_ceiling, 50, 99)?;
         // The weekly trigger is independent of the session trigger (issue #41):
-        // its own 50..=99 bound, with NO cross-field rule — weekly may sit below
+        // its own 50..=100 bound, with NO cross-field rule — weekly may sit below
         // session (an unusual but valid operator choice), so both are configurable
-        // independently (AC #3).
-        range("weekly_ceiling", t.weekly_ceiling, 50, 99)?;
+        // independently (AC #3). The weekly bound reaches 100 (the session one's
+        // stays 99): the operator may spend the last 1–2 pp of a weekly window,
+        // accepting the sliver of overage past the effective `ceiling −
+        // WEEKLY_TAIL_MARGIN` line that implies.
+        range("weekly_ceiling", t.weekly_ceiling, 50, 100)?;
         // Issue #452 (ADR-0017) bounded-blindness preemptive-swap gate. `session_blind_swap_secs`
         // is `T` in seconds: floored at 60 (at least one poll cycle blind) and capped at 86400 — a
         // 24 h ceiling far beyond any real blind window, so setting it there disables the path (the
@@ -651,14 +654,27 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_weekly_ceiling() {
-        // #41: the weekly trigger carries the same 50..=99 bound as the session one.
-        for trigger in ["49", "100", "120"] {
+        // #41: the weekly trigger carries its own 50..=100 bound — one point
+        // past the session trigger's 50..=99.
+        for trigger in ["49", "101", "120"] {
             let toml = with_tunables(&format!("weekly_ceiling = {trigger}"));
             assert!(
                 matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))),
                 "weekly_ceiling = {trigger} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn accepts_weekly_ceiling_at_100() {
+        // The weekly bound reaches 100 where session's stays 99: the operator may
+        // spend the last 1–2 pp of a weekly window, accepting the sliver of
+        // overage past the `ceiling − WEEKLY_TAIL_MARGIN` fire line.
+        let t = Config::parse(&with_tunables("weekly_ceiling = 100"))
+            .unwrap()
+            .tunables;
+        assert_eq!(t.weekly_ceiling, 100);
+        assert_eq!(t.weekly_ceiling_strategy.base, 100.0);
     }
 
     #[test]
@@ -1844,14 +1860,14 @@ mod tests {
 
     #[test]
     fn accepts_inclusive_bounds() {
-        // Each bound's edge is valid: trigger 50/99, target_max_session_usage 1 (the non-zero lower bound;
-        // 0 admits no target) and floor == trigger, poll 5/3600, cooldown 5/3600 (5 =
-        // the non-zero floor, #272), monitor 1/20.
+        // Each bound's edge is valid: trigger 50/99 (weekly 50/100), target_max_session_usage 1
+        // (the non-zero lower bound; 0 admits no target) and floor == trigger, poll 5/3600,
+        // cooldown 5/3600 (5 = the non-zero floor, #272), monitor 1/20.
         for fragment in [
             "session_ceiling = 50\ntarget_max_session_usage = 1",
             "session_ceiling = 99\ntarget_max_session_usage = 99", // target_max_session_usage == trigger is allowed
             "weekly_ceiling = 50",
-            "weekly_ceiling = 99",
+            "weekly_ceiling = 100",
             "poll_secs = 5",
             "poll_secs = 3600",
             "cooldown_secs = 5",

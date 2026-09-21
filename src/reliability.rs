@@ -7660,8 +7660,9 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
         const { assert!(SESSION_MAX_TAIL / 4.0 > crate::swap::WEEKLY_TAIL_MARGIN) };
 
         // The structural half, which does NOT depend on k: the landing sits below the ceiling for
-        // every operator-settable weekly ceiling, and so below the real 100% weekly wall.
-        for ceiling_pct in 50..=99u8 {
+        // every operator-settable weekly ceiling, and so below the real 100% weekly wall (the
+        // ceiling itself may now be set AT 100 — the margin still holds the fire point below it).
+        for ceiling_pct in 50..=100u8 {
             let ceiling = f64::from(ceiling_pct) / 100.0;
             let fire = crate::swap::weekly_effective_ceiling(ceiling);
             assert!(
@@ -7669,7 +7670,7 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
                 "weekly ceiling {ceiling_pct}: fire below ceiling"
             );
             assert!(fire + crate::swap::WEEKLY_TAIL_MARGIN <= ceiling + 1e-9);
-            assert!(ceiling < 1.0);
+            assert!(fire < 1.0);
         }
     }
 

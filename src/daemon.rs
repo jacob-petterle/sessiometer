@@ -295,11 +295,11 @@ mod snapshot_build;
 const SESSION_CEILING_PCT_LO: f64 = 50.0;
 const SESSION_CEILING_PCT_HI: f64 = 99.0;
 /// Per-cycle clamp bounds for the WEEKLY swap-away trigger draw, in PERCENT
-/// (issue #41) — mirrors config's `weekly_ceiling` range. Its own constants
-/// (numerically equal to the session bounds today) so the two triggers stay
-/// independently bounded.
+/// (issue #41) — mirrors config's `weekly_ceiling` range. Its own constants,
+/// and NOT numerically equal to the session bounds: the weekly bound reaches
+/// 100 so the operator may spend the last 1–2 pp of a weekly window.
 const WEEKLY_CEILING_PCT_LO: f64 = 50.0;
-const WEEKLY_CEILING_PCT_HI: f64 = 99.0;
+const WEEKLY_CEILING_PCT_HI: f64 = 100.0;
 /// Per-cycle clamp bounds for the cooldown draw, in seconds. The LOW bound is the
 /// non-zero swap-cooldown floor ([`crate::config::COOLDOWN_SECS_FLOOR`], issue #272),
 /// which the config `cooldown_secs` range mirrors (`floor..=3600`). Clamping every
@@ -1727,7 +1727,7 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// deterministic display paths key off instead.
     session_ceiling_strategy: Strategy,
     /// Per-cycle WEEKLY swap-away trigger strategy (issue #41): drawn + clamped to
-    /// `50..=99` percent each cycle, then `/100` for the swap decision — the
+    /// `50..=100` percent each cycle, then `/100` for the swap decision — the
     /// weekly-dimension counterpart of `session_ceiling_strategy`, independent of it.
     weekly_ceiling_strategy: Strategy,
     /// Base WEEKLY CEILING as a fraction (`weekly_ceiling / 100`), un-jittered — the configured
@@ -4170,7 +4170,8 @@ where
         self.state.signaled_retry_after_reserve = false;
         self.state.signaled_retry_after_walk = false;
         // Draw this cycle's swap-away CEILINGS — session and weekly (issues #38, #41; #597, #607,
-        // #609): each jittered + clamped to 50..=99 percent, then to a fraction. Since #597
+        // #609): each jittered + clamped to its config range (session 50..=99,
+        // weekly 50..=100) percent, then to a fraction. Since #597
         // (session) and #607 (weekly), BOTH are the same KIND of value: a settled CEILING — the line
         // the account must not cross — NOT a fire-at trigger. Each dimension's fire threshold is
         // derived BACKWARD from its own ceiling below, through its own independently-calibrated tail

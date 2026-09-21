@@ -470,7 +470,7 @@ pub(crate) struct Tunables {
     /// tail/coupling evidence: ADR-0023 (the ceiling redesign, superseding ADR-0022) and ADR-0024 (the
     /// gap-percentile lookahead + max-window coverage + downward-only ceiling jitter).
     pub(crate) session_ceiling: u8,
-    /// The settled WEEKLY CEILING (`50..=99` percent) — the weekly line the active account must not
+    /// The settled WEEKLY CEILING (`50..=100` percent) — the weekly line the active account must not
     /// cross — and the second, independent ceiling dimension (issue #41). Separate from
     /// `session_ceiling` (no cross-field constraint), typically set higher; the daemon swaps when
     /// EITHER dimension reaches its own fire point.
@@ -622,8 +622,9 @@ pub(crate) struct Tunables {
     pub(crate) session_ceiling_strategy: Strategy,
     /// Weekly swap-away trigger timing strategy (issue #41), in the PERCENT
     /// domain: base = `weekly_ceiling`, no jitter unless configured. Drawn +
-    /// clamped to `50..=99` each cycle, then divided by 100 for the swap decision
-    /// — the weekly-dimension counterpart of `session_ceiling_strategy`.
+    /// clamped to `50..=100` each cycle, then divided by 100 for the swap decision
+    /// — the weekly-dimension counterpart of `session_ceiling_strategy` (whose
+    /// bound stays `50..=99`).
     pub(crate) weekly_ceiling_strategy: Strategy,
     /// Post-swap cooldown timing strategy (issue #38), in seconds: base =
     /// `cooldown_secs`, no jitter unless configured. Drawn + clamped to

@@ -491,7 +491,7 @@ impl Config {
         );
         out.push_str(&format!("session_ceiling = {}\n", t.session_ceiling));
         out.push_str(
-            "# The settled WEEKLY CEILING (50..=99) — the weekly line the active account must\n\
+            "# The settled WEEKLY CEILING (50..=100) — the weekly line the active account must\n\
              # NOT cross. Independent of session_ceiling (typically higher): a swap fires when\n\
              # EITHER dimension reaches its own fire point. Like session_ceiling this is a\n\
              # ceiling, not a fire-at value (issue #607): the swap fires BACKWARD from it, 1 pp\n\

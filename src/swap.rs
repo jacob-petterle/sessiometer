@@ -1210,7 +1210,7 @@ mod tests {
     #[test]
     fn the_weekly_fire_point_is_strictly_early_across_the_operator_range() {
         // The per-dimension strict-early-fire invariant (issue #607): for every weekly ceiling the
-        // operator can set (`50..=99`, config-clamped), the weekly fire point sits STRICTLY below
+        // operator can set (`50..=100`, config-clamped), the weekly fire point sits STRICTLY below
         // the ceiling — so a weekly swap always lands with tail headroom, never AT the line. This
         // is the weekly half of what `effective_ceiling` guarantees for session; the two are
         // asserted independently because the dimensions are independent (issue #41).
@@ -1220,7 +1220,7 @@ mod tests {
         // the `k >= 5` assumption documented on `WEEKLY_TAIL_MARGIN`, and restating that assumption
         // as a loop-invariant comparison of two constants would dress one unverified premise up as
         // independent corroboration. Only a weekly landing SLI can settle the magnitude.
-        for ceiling_pct in 50..=99u8 {
+        for ceiling_pct in 50..=100u8 {
             let ceiling = f64::from(ceiling_pct) / 100.0;
             let fire = weekly_effective_ceiling(ceiling);
             assert!(
@@ -1255,12 +1255,21 @@ mod tests {
     }
 
     #[test]
+    fn viability_boundary_reaches_099_at_the_maximum_weekly_ceiling() {
+        // At the weekly bound's 100 end the effective viability line is 0.99:
+        // an account resting at 98% weekly is a viable target, and the last
+        // margin point lands the outgoing account just under the raw ceiling.
+        let b = viability_boundary(0.99, 0.80, 1.0);
+        assert!((b.weekly - 0.99).abs() < 1e-9);
+    }
+
+    #[test]
     fn viability_boundary_weekly_arm_tracks_weekly_effective_ceiling_exactly() {
         // The anti-drift property this type exists for (issue #803): the boundary's weekly arm is
         // not a re-derivation but the SAME function the daemon's release and acquire predicates
         // call, so no future edit can move one without moving the other. Asserted across the
         // operator-settable range rather than at one point, so a divergence anywhere fails.
-        for ceiling_pct in 50..=99u8 {
+        for ceiling_pct in 50..=100u8 {
             let ceiling = f64::from(ceiling_pct) / 100.0;
             assert_eq!(
                 viability_boundary(0.95, 0.80, ceiling).weekly,
