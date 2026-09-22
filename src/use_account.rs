@@ -1378,6 +1378,8 @@ mod tests {
                     },
                     severity: None,
                     weekly_scoped_model: None,
+                    weekly_scoped_resets_at: None,
+                    extra_usage: None,
                 }),
                 Probe::Dead => Err(Error::UsageUnauthorized),
                 Probe::ScopeMissing => Err(Error::UsageScopeMissing),
@@ -5466,6 +5468,8 @@ mod tests {
             // Bounded-blindness (#479) is a daemon `status`-snapshot concern, not read by the
             // cached-viability gate — inert here.
             blind_active: None,
+            // The paid-extra-usage posture is likewise display-only — never a gate input.
+            extra_usage: None,
             // Likewise the #882 refresh-token expiry modifier: surfaced, never acted upon, so the
             // viability gate does not read it.
             expiry: None,

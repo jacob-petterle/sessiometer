@@ -88,7 +88,11 @@ where
             self.poller
                 .poll(&self.roster[i], true)
                 .await
-                .map(|reading| reading.usage)
+                .map(|reading| {
+                    // Same extra-usage carry as the primary poll fold (sample-only).
+                    self.state.accounts[i].last_extra_usage = reading.extra_usage.clone();
+                    reading.usage
+                })
         } else {
             // No fresh token promoted → the 401 stands so the #42 streak advances (invariant 4).
             Err(Error::UsageUnauthorized)

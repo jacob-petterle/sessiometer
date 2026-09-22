@@ -167,7 +167,11 @@ where
     /// showed a `CredentialDead` edge but not the poll-refresh that preceded it. That line carries
     /// [`PollRefreshTrigger::Poll401`] (issue #1367), separating it from the SAME event's other
     /// origin — [`reprobe_dead_parked_credential`](Self::reprobe_dead_parked_credential).
-    pub(super) async fn refresh_retry(&self, i: usize, events: &mut Vec<Event>) -> Result<Usage> {
+    pub(super) async fn refresh_retry(
+        &mut self,
+        i: usize,
+        events: &mut Vec<Event>,
+    ) -> Result<Usage> {
         let refreshed = match self.poll_refresh.as_ref() {
             Some(engine) => engine.refresh(&self.roster[i]).await,
             // Unreachable given the `should_refresh_retry` guard; treat as could-not-revive.
@@ -204,7 +208,11 @@ where
                 .poller
                 .poll(&self.roster[i], false)
                 .await
-                .map(|reading| reading.usage),
+                .map(|reading| {
+                    // Same extra-usage carry as the primary poll fold (sample-only).
+                    self.state.accounts[i].last_extra_usage = reading.extra_usage.clone();
+                    reading.usage
+                }),
             // Could not revive (spawn / read-back failure) → fail-safe: the 401 stands.
             Err(_) => Err(Error::UsageUnauthorized),
         }

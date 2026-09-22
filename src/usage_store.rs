@@ -88,6 +88,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::paths;
+use crate::usage::ExtraUsage;
 
 /// Seconds in an hour — the hourly-bucket alignment unit.
 const HOUR_SECS: i64 = 3_600;
@@ -154,13 +155,25 @@ pub(crate) struct Sample {
     /// lines written before the breakdown was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) weekly_all: Option<f64>,
-    /// The highest ACTIVE per-model `weekly_scoped` cap's fraction, when the
-    /// poll's response carried one.
+    /// The highest per-model `weekly_scoped` cap's fraction, when the poll's
+    /// response carried one (`is_active` marks the UI-highlighted limit, not
+    /// applicability — an inactive scoped entry still applies).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) weekly_scoped: Option<f64>,
     /// The scoped entry's model display name (e.g. `"Fable"`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) weekly_scoped_model: Option<String>,
+    /// Epoch seconds at which the winning SCOPED weekly window resets, when the
+    /// poll carried one — beside `weekly_resets_at` (which is the scoped reset
+    /// only while the scoped cap is the binding constraint), so a reader can
+    /// chart the per-model reset even when the all-models window binds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly_scoped_resets_at: Option<i64>,
+    /// The account's paid-extra-usage posture at poll time, when the response
+    /// reported one (`extra_usage`, or the `spend` fallback). Omitted entirely
+    /// when absent, so lines from an older daemon keep their shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) extra_usage: Option<ExtraUsage>,
     /// Epoch seconds at which the SESSION window resets, when the poll knew it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_resets_at: Option<i64>,
@@ -200,6 +213,8 @@ impl Sample {
             weekly_all: None,
             weekly_scoped: None,
             weekly_scoped_model: None,
+            weekly_scoped_resets_at: None,
+            extra_usage: None,
             session_resets_at: None,
             weekly_resets_at: None,
             severity: None,
@@ -220,6 +235,20 @@ impl Sample {
         self.weekly_all = weekly_all;
         self.weekly_scoped = weekly_scoped;
         self.weekly_scoped_model = weekly_scoped_model;
+        self
+    }
+
+    /// Attach the winning scoped cap's own weekly reset instant (optional —
+    /// `None` when the poll carried no scoped entry or no parseable reset).
+    pub(crate) fn with_weekly_scoped_reset(mut self, weekly_scoped_resets_at: Option<i64>) -> Self {
+        self.weekly_scoped_resets_at = weekly_scoped_resets_at;
+        self
+    }
+
+    /// Attach the paid-extra-usage posture the poll reported (optional —
+    /// `None` when the response carried neither `extra_usage` nor `spend`).
+    pub(crate) fn with_extra_usage(mut self, extra_usage: Option<ExtraUsage>) -> Self {
+        self.extra_usage = extra_usage;
         self
     }
 
@@ -918,6 +947,8 @@ mod tests {
             "weekly_all",
             "weekly_scoped",
             "weekly_scoped_model",
+            "weekly_scoped_resets_at",
+            "extra_usage",
             "session_resets_at",
             "weekly_resets_at",
             "severity",
@@ -925,6 +956,37 @@ mod tests {
         ] {
             assert!(!json.contains(absent), "absent optional leaked: {json}");
         }
+    }
+
+    #[test]
+    fn extra_usage_and_scoped_reset_round_trip_on_a_sample_line() {
+        // The paid-extra-usage posture + scoped weekly reset persist as optional
+        // fields and round-trip through the JSONL line shape.
+        let extra = ExtraUsage {
+            is_enabled: true,
+            used_credits: 0,
+            monthly_limit: Some(40000),
+            spend_limit_reached: false,
+            currency: Some("USD".to_owned()),
+            decimal_places: 2,
+        };
+        let sample = sample(1_700_000_000, 0.90, 0.70)
+            .with_weekly_breakdown(Some(0.53), Some(0.70), Some("Fable".to_owned()))
+            .with_weekly_scoped_reset(Some(1_700_600_000))
+            .with_extra_usage(Some(extra.clone()));
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(
+            json.contains("\"weekly_scoped_resets_at\":1700600000"),
+            "scoped reset present: {json}"
+        );
+        assert!(
+            json.contains("\"extra_usage\":{"),
+            "extra_usage present: {json}"
+        );
+        let restored: Sample = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, sample);
+        assert_eq!(restored.extra_usage, Some(extra));
+        assert_eq!(restored.weekly_scoped_resets_at, Some(1_700_600_000));
     }
 
     #[test]

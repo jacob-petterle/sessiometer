@@ -942,6 +942,8 @@ mod tests {
                     },
                     severity: None,
                     weekly_scoped_model: None,
+                    weekly_scoped_resets_at: None,
+                    extra_usage: None,
                 }),
                 Err(err) => Err(err),
             }

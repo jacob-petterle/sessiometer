@@ -388,6 +388,10 @@ pub(crate) struct AccountReading {
     /// projection stays threshold-free; `false` when the last poll failed.
     pub(crate) weekly_exhausted: bool,
     pub(crate) usage: Option<Usage>,
+    /// The account's latest paid-extra-usage posture ([`crate::usage::ExtraUsage`]) — the
+    /// poll-folded sample-only carry (`AccountRuntime::last_extra_usage`), copied straight
+    /// to the wire (`AccountStatusLine::extra_usage`). `None` until a poll reports one.
+    pub(crate) extra_usage: Option<crate::usage::ExtraUsage>,
     /// The stored access-token `expiresAt` as epoch SECONDS (issue #119), or `None` until
     /// the refresh engine has observed this account's stash. An absolute instant (not a
     /// relative duration, like `session_resets_at`) carried RAW on the wire, from which a
@@ -537,7 +541,7 @@ pub(crate) struct SchemaVersion {
 /// always-present key as `Some(_)`.
 pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion {
     major: 1,
-    minor: 14,
+    minor: 15,
 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
@@ -814,6 +818,13 @@ pub(crate) struct AccountStatusLine {
     /// unknown key, the minor-bump tolerate-by-ignoring convention). Non-secret (issue #15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) blind_active: Option<BlindActive>,
+    /// The account's latest paid-extra-usage posture (`extra_usage` / `spend` on the
+    /// usage response), or absent until a poll reports one — the additive MINOR
+    /// [`STATUS_SCHEMA_VERSION`] bump 1.14 → 1.15, per the added-field convention:
+    /// an omitting daemon decodes to `None`, a pre-1.15 client ignores the key.
+    /// Non-secret — amounts and flags only, never a token or identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) extra_usage: Option<crate::usage::ExtraUsage>,
     /// This account's REFRESH-token expiry MODIFIER ([`AccountExpiry`], issue #882): the observed
     /// `refreshTokenExpiresAt` deadline plus its [`ExpiryHorizon`] classification against the
     /// operator's `[credential].expiry_horizon_secs` foresight window — or absent until the account
@@ -1014,6 +1025,9 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 // `Daemon::snapshot`; copied straight to the wire. `None` for every non-active or
                 // non-blind account, so `skip_serializing_if` omits it there.
                 blind_active: account.blind_active,
+                // The paid-extra-usage posture — the poll-folded sample-only carry;
+                // `None` until a poll reports one (omitted on the wire there).
+                extra_usage: account.extra_usage.clone(),
                 // The refresh-token expiry modifier (issue #882), classified daemon-side in
                 // `Daemon::snapshot` by `account_expiry`; copied straight to the wire. `None` until
                 // the account has been polled at all, so `skip_serializing_if` omits it there — and

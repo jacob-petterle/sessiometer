@@ -54,6 +54,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::cell::RefCell;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -88,17 +89,17 @@ pub(crate) struct Usage {
     /// Fraction in `[0.0, 1.0]` of the rolling 5-hour session window consumed.
     pub(crate) session: f64,
     /// Fraction in `[0.0, 1.0]` of the weekly window consumed — the BINDING
-    /// reading: the all-models `weekly_all`, or an active per-model
-    /// `weekly_scoped` cap when that sits higher.
+    /// reading: the all-models `weekly_all`, or a per-model `weekly_scoped`
+    /// cap when that sits higher.
     pub(crate) weekly: f64,
     /// Fraction in `[0.0, 1.0]` of the ALL-MODELS weekly window consumed — the
     /// `seven_day` reading BEFORE any `weekly_scoped` override. Kept beside
     /// `weekly` so the sample store can persist the overall-vs-scoped split for
     /// external readers.
     pub(crate) weekly_all: f64,
-    /// The highest ACTIVE per-model `weekly_scoped` cap's fraction, when the
-    /// response carried one; `None` when no active scoped entry exists (so the
-    /// reading is all-models only). The cap's model name rides the sample-only
+    /// The highest per-model `weekly_scoped` cap's fraction, when the response
+    /// carried one; `None` when no scoped entry exists (so the reading is
+    /// all-models only). The cap's model name rides the sample-only
     /// channel instead ([`PolledReading::weekly_scoped_model`]) — an owned
     /// `String` here would cost `Usage` its `Copy`.
     pub(crate) weekly_scoped: Option<f64>,
@@ -142,6 +143,41 @@ pub(crate) struct PolledReading {
     /// alongside [`Usage::weekly_scoped`]. Kept here rather than on [`Usage`] so
     /// the pervasive `Copy` decision type carries no owned `String`.
     pub(crate) weekly_scoped_model: Option<String>,
+    /// Epoch seconds at which the winning `weekly_scoped` entry's window resets,
+    /// when it carried a parseable timestamp. Kept BESIDE
+    /// [`Usage::weekly_resets_at`] (which is the scoped reset only while the
+    /// scoped cap overrides) so a consumer can chart the per-model reset even
+    /// when the all-models window is the binding one.
+    pub(crate) weekly_scoped_resets_at: Option<i64>,
+    /// The account's paid-extra-usage posture, when the response reported one —
+    /// top-level `extra_usage`, falling back to the `spend` object when the API
+    /// omits the former. Persisted to the sample store and `status --json`; the
+    /// swap-decision path does not consume it. Non-secret throughout (amounts
+    /// and flags only — never identifiers).
+    pub(crate) extra_usage: Option<ExtraUsage>,
+}
+
+/// The provider's paid-extra-usage posture for an account (the response's
+/// `extra_usage` block, or the `spend` block's equivalent). When enabled, an
+/// account that reaches its weekly cap is billed per-credit rather than blocked,
+/// which the dashboard surfaces so an operator can see overage before choosing
+/// to ride an account past 100 %. All fields are non-secret amounts/flags.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ExtraUsage {
+    /// Whether paid extra usage is enabled for the account.
+    pub(crate) is_enabled: bool,
+    /// Credits consumed so far this month, in minor units of `currency`.
+    pub(crate) used_credits: i64,
+    /// The monthly credit limit in minor units, when the API reported one.
+    pub(crate) monthly_limit: Option<i64>,
+    /// Whether the spend limit has been reached.
+    pub(crate) spend_limit_reached: bool,
+    /// ISO-style currency code (e.g. `"USD"`), when reported.
+    pub(crate) currency: Option<String>,
+    /// Decimal places the minor-unit amounts are expressed in (`amount_minor /
+    /// 10^decimal_places` = major units) — the `extra_usage` block's
+    /// `decimal_places`, or a `spend` money object's `exponent`.
+    pub(crate) decimal_places: u8,
 }
 
 /// The full parse of a usage response: both dimensions plus each window's reset
@@ -159,12 +195,19 @@ struct UsageReport {
     /// BEFORE a higher `weekly_scoped` cap overrode `weekly`. Kept verbatim so
     /// the sample store can persist the overall-vs-scoped split.
     weekly_all: f64,
-    /// The highest ACTIVE `weekly_scoped` entry's fraction, `None` when the
-    /// response carried no active scoped cap.
+    /// The highest `weekly_scoped` entry's fraction, `None` when the response
+    /// carried no scoped cap.
     weekly_scoped: Option<f64>,
     /// That scoped entry's `scope.model.display_name` (e.g. `"Fable"`), `None`
     /// when the scope or name is missing.
     weekly_scoped_model: Option<String>,
+    /// The winning scoped entry's raw `resets_at` (see `weekly_resets_at`),
+    /// regardless of whether the scoped cap outvoted the all-models window.
+    weekly_scoped_resets_at: Option<String>,
+    /// The account's paid-extra-usage posture — top-level `extra_usage`, or the
+    /// `spend` block's equivalent when the former is absent; `None` when the
+    /// response carried neither.
+    extra_usage: Option<ExtraUsage>,
     /// Raw `resets_at` of the session window, as the API rendered it (ISO string
     /// or epoch-as-string); tolerant — `None` if absent/unrecognized. Projected to
     /// epoch seconds by [`to_usage`](UsageReport::to_usage) for the `status`
@@ -280,6 +323,11 @@ where
                     usage: report.to_usage(),
                     severity: report.severity(),
                     weekly_scoped_model: report.weekly_scoped_model.clone(),
+                    weekly_scoped_resets_at: report
+                        .weekly_scoped_resets_at
+                        .as_deref()
+                        .and_then(epoch_from_resets_at),
+                    extra_usage: report.extra_usage.clone(),
                 })
             }
             UsageStatus::ScopeMissing => Err(Error::UsageScopeMissing),
@@ -489,12 +537,16 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
     // A per-model `weekly_scoped` cap above the all-models window is the binding
     // constraint — take it over the top-level `seven_day` reading. Either way the
     // breakdown is recorded: `weekly_all` keeps the pre-override all-models
-    // fraction and the scoped fields carry the cap + its model name.
+    // fraction and the scoped fields carry the cap + its model name. `is_active`
+    // is ignored: it marks the limit Claude's UI currently highlights, not
+    // whether the cap applies — an inactive scoped entry still applies.
     let mut weekly_scoped = None;
     let mut weekly_scoped_model = None;
-    if let Some(scoped) = max_active_weekly_scoped(&root) {
+    let mut weekly_scoped_resets_at = None;
+    if let Some(scoped) = max_weekly_scoped(&root) {
         weekly_scoped = Some(scoped.fraction);
         weekly_scoped_model = scoped.model;
+        weekly_scoped_resets_at = scoped.resets_at.clone();
         if scoped.fraction > weekly {
             weekly = scoped.fraction;
             weekly_resets_at = scoped.resets_at;
@@ -508,6 +560,8 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
         weekly_all,
         weekly_scoped,
         weekly_scoped_model,
+        weekly_scoped_resets_at,
+        extra_usage: extra_usage_of(&root),
         session_resets_at,
         weekly_resets_at,
         session_severity,
@@ -560,7 +614,7 @@ fn dimension(
     fallback
 }
 
-/// One active `limits[]` entry of `kind == "weekly_scoped"` — a per-model weekly
+/// One `limits[]` entry of `kind == "weekly_scoped"` — a per-model weekly
 /// cap — distilled to what [`parse_usage`] needs. Named fields rather than a
 /// four-element tuple, so the three optional strings (`resets_at` / `severity` /
 /// `model`) cannot be confused positionally.
@@ -577,27 +631,23 @@ struct WeeklyScoped {
 }
 
 /// The highest [`WeeklyScoped`] among `limits[]` entries with
-/// `kind == "weekly_scoped"` that are active (`is_active` true or absent; an
-/// explicit `false` is skipped — unlike [`dimension`]'s inactive fallback, a
-/// scoped cap the API has switched off must never outvote the all-models
-/// window). A scoped per-model weekly cap is the BINDING constraint when it is
-/// higher than the all-models window: `weekly_all` aggregates every model, so a
-/// Fable-heavy account can sit at 44 % overall while its Fable cap is already at
-/// 74 %, and it is the 74 % that exhausts the account. `None` when no active
-/// scoped entry carries a readable fraction.
-fn max_active_weekly_scoped(root: &Value) -> Option<WeeklyScoped> {
+/// `kind == "weekly_scoped"` that carry a readable fraction. `is_active` is
+/// NOT consulted: it marks which limit Claude's UI currently highlights (the
+/// most severe one), not whether the cap applies — the live API routinely marks
+/// a still-applicable `weekly_scoped` entry `is_active: false` (e.g. while the
+/// session limit is the highlighted one), so skipping it would under-report the
+/// account's true per-model weekly load. A scoped per-model weekly cap is the
+/// BINDING constraint when it is higher than the all-models window:
+/// `weekly_all` aggregates every model, so a Fable-heavy account can sit at
+/// 44 % overall while its Fable cap is already at 74 %, and it is the 74 %
+/// that exhausts the account. `None` when no scoped entry carries a readable
+/// fraction.
+fn max_weekly_scoped(root: &Value) -> Option<WeeklyScoped> {
     let limits = root.get("limits").and_then(Value::as_array)?;
     let mut max: Option<WeeklyScoped> = None;
     for entry in limits {
         let kind = entry.get("kind").and_then(Value::as_str);
         if kind != Some("weekly_scoped") {
-            continue;
-        }
-        let active = entry
-            .get("is_active")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if !active {
             continue;
         }
         let Some(fraction) = fraction_of(entry) else {
@@ -625,6 +675,77 @@ fn scoped_model_of(entry: &Value) -> Option<String> {
         .get("display_name")?
         .as_str()
         .map(str::to_owned)
+}
+
+/// Read the account's paid-extra-usage posture: the top-level `extra_usage`
+/// object when present, otherwise the `spend` block's equivalent (`used` /
+/// `limit` money objects plus `enabled`); `None` when the response carried
+/// neither. Tolerant — a missing field takes its neutral default rather than
+/// failing the parse, and no identifiers or amounts are ever logged here.
+fn extra_usage_of(root: &Value) -> Option<ExtraUsage> {
+    if let Some(obj) = root.get("extra_usage") {
+        return Some(ExtraUsage {
+            is_enabled: obj
+                .get("is_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            used_credits: obj.get("used_credits").and_then(Value::as_i64).unwrap_or(0),
+            monthly_limit: obj.get("monthly_limit").and_then(Value::as_i64),
+            spend_limit_reached: obj
+                .get("spend_limit_reached")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            currency: obj
+                .get("currency")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            decimal_places: obj
+                .get("decimal_places")
+                .and_then(Value::as_u64)
+                .map(|places| places.min(u64::from(u8::MAX)) as u8)
+                .unwrap_or(0),
+        });
+    }
+    let spend = root.get("spend")?;
+    let money_field = |name: &str| {
+        spend
+            .get(name)
+            .and_then(|money| money.get("amount_minor"))
+            .and_then(Value::as_i64)
+    };
+    let money_str = |name: &str, key: &str| {
+        spend
+            .get(name)
+            .and_then(|money| money.get(key))
+            .and_then(Value::as_str)
+    };
+    let money_num = |name: &str, key: &str| {
+        spend
+            .get(name)
+            .and_then(|money| money.get(key))
+            .and_then(Value::as_u64)
+    };
+    Some(ExtraUsage {
+        is_enabled: spend
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        used_credits: money_field("used").unwrap_or(0),
+        monthly_limit: money_field("limit"),
+        // `spend` carries no explicit limit-reached flag; derive it from the
+        // reported limit and usage.
+        spend_limit_reached: match (money_field("used"), money_field("limit")) {
+            (Some(used), Some(limit)) => used >= limit,
+            _ => false,
+        },
+        currency: money_str("used", "currency")
+            .or_else(|| money_str("limit", "currency"))
+            .map(str::to_owned),
+        decimal_places: money_num("used", "exponent")
+            .or_else(|| money_num("limit", "exponent"))
+            .map(|exp| exp.min(u64::from(u8::MAX)) as u8)
+            .unwrap_or(0),
+    })
 }
 
 /// Read a usage fraction in `[0.0, 1.0]` from an object: a `utilization`
@@ -985,9 +1106,10 @@ mod tests {
     }
 
     #[test]
-    fn inactive_weekly_scoped_is_ignored() {
-        // `is_active: false` on a scoped entry means the API has switched that
-        // cap off — it must never outvote the all-models window, even at 90 %.
+    fn inactive_weekly_scoped_still_applies() {
+        // `is_active: false` marks which limit Claude's UI currently highlights
+        // — it does NOT switch the cap off. An inactive 90 % scoped entry is
+        // still the binding constraint over the 44 % all-models window.
         let body = r#"{
             "five_hour": { "utilization": 0.0, "resets_at": null },
             "seven_day": { "utilization": 44.0, "resets_at": "2026-09-24T16:00:00.485164+00:00" },
@@ -999,11 +1121,198 @@ mod tests {
             ]
         }"#;
         let report = parse_usage(body).unwrap();
-        assert!((report.weekly - 0.44).abs() < 1e-9);
+        assert!((report.weekly - 0.90).abs() < 1e-9);
+        assert_eq!(report.weekly_scoped, Some(0.90));
+        assert_eq!(report.weekly_scoped_model.as_deref(), Some("Fable"));
+        // The scoped cap overrode → its reset becomes the weekly reset.
         assert_eq!(
             report.weekly_resets_at.as_deref(),
-            Some("2026-09-24T16:00:00.485164+00:00")
+            Some("2026-09-24T16:00:00.485335+00:00")
         );
+        assert_eq!(
+            report.weekly_scoped_resets_at.as_deref(),
+            Some("2026-09-24T16:00:00.485335+00:00")
+        );
+    }
+
+    #[test]
+    fn the_highest_scoped_entry_wins_regardless_of_is_active() {
+        // Two scoped caps: Fable 70 % inactive, Sonnet 20 % active. `is_active`
+        // marks the highlighted limit, not applicability, so the higher cap
+        // (Fable) still wins.
+        let body = r#"{
+            "five_hour": { "utilization": 0.0, "resets_at": null },
+            "seven_day": { "utilization": 44.0, "resets_at": "2026-09-24T16:00:00.485164+00:00" },
+            "limits": [
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 70, "severity": "normal",
+                  "resets_at": "2026-09-24T16:00:00.485335+00:00",
+                  "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
+                  "is_active": false },
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 20, "severity": "normal",
+                  "resets_at": "2026-09-25T16:00:00.485335+00:00",
+                  "scope": { "model": { "id": null, "display_name": "Sonnet" }, "surface": null },
+                  "is_active": true }
+            ]
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!((report.weekly - 0.70).abs() < 1e-9);
+        assert_eq!(report.weekly_scoped, Some(0.70));
+        assert_eq!(report.weekly_scoped_model.as_deref(), Some("Fable"));
+    }
+
+    /// The scrubbed live capture of acct-14's `GET /api/oauth/usage` response
+    /// (token/ids removed): session 90 % active, weekly_all 53 % inactive, and a
+    /// `weekly_scoped` Fable cap at 70 % — ALSO inactive, because `is_active`
+    /// marks the highlighted limit (the session one), not applicability. This is
+    /// the payload that exposed the bug: the scoped cap must still read 0.70 and
+    /// override the binding `weekly`.
+    const ACCT14_USAGE_SCRUBBED: &str = r#"{
+        "five_hour": {
+            "utilization": 90,
+            "resets_at": "2026-09-22T20:00:00.618246+00:00"
+        },
+        "seven_day": {
+            "utilization": 53,
+            "resets_at": "2026-09-27T04:00:00.618269+00:00"
+        },
+        "extra_usage": {
+            "is_enabled": true,
+            "monthly_limit": 40000,
+            "used_credits": 0,
+            "currency": "USD",
+            "decimal_places": 2,
+            "spend_limit_reached": false
+        },
+        "limits": [
+            {
+                "kind": "session",
+                "percent": 90,
+                "severity": "critical",
+                "resets_at": "2026-09-22T20:00:00.618246+00:00",
+                "is_active": true
+            },
+            {
+                "kind": "weekly_all",
+                "percent": 53,
+                "severity": "normal",
+                "resets_at": "2026-09-27T04:00:00.618269+00:00",
+                "is_active": false
+            },
+            {
+                "kind": "weekly_scoped",
+                "percent": 70,
+                "severity": "normal",
+                "resets_at": "2026-09-27T04:00:00.618462+00:00",
+                "scope": {
+                    "model": {
+                        "id": "model-id-redacted",
+                        "display_name": "Fable"
+                    },
+                    "surface": null
+                },
+                "is_active": false
+            }
+        ],
+        "spend": {
+            "used": {
+                "amount_minor": 0,
+                "currency": "USD",
+                "exponent": 2
+            },
+            "limit": {
+                "amount_minor": 40000,
+                "currency": "USD",
+                "exponent": 2
+            },
+            "percent": 0,
+            "severity": "normal",
+            "enabled": true
+        }
+    }"#;
+
+    #[test]
+    fn parses_the_scrubbed_acct14_capture_inactive_scoped_included() {
+        let report = parse_usage(ACCT14_USAGE_SCRUBBED).unwrap();
+        assert!(
+            (report.weekly_all - 0.53).abs() < 1e-9,
+            "weekly_all was {}",
+            report.weekly_all
+        );
+        assert_eq!(report.weekly_scoped, Some(0.70));
+        // The inactive scoped cap is still applicable — and binding.
+        assert!(
+            (report.weekly - 0.70).abs() < 1e-9,
+            "weekly was {}",
+            report.weekly
+        );
+        assert_eq!(report.weekly_scoped_model.as_deref(), Some("Fable"));
+        // The scoped entry overrode → the weekly reset is its reset.
+        assert_eq!(
+            report.weekly_resets_at.as_deref(),
+            Some("2026-09-27T04:00:00.618462+00:00")
+        );
+        assert_eq!(
+            report.weekly_scoped_resets_at.as_deref(),
+            Some("2026-09-27T04:00:00.618462+00:00")
+        );
+        // The `extra_usage` block takes precedence over `spend`.
+        let extra = report.extra_usage.expect("extra_usage parsed");
+        assert!(extra.is_enabled);
+        assert_eq!(extra.used_credits, 0);
+        assert_eq!(extra.monthly_limit, Some(40000));
+        assert!(!extra.spend_limit_reached);
+        assert_eq!(extra.currency.as_deref(), Some("USD"));
+        assert_eq!(extra.decimal_places, 2);
+    }
+
+    #[test]
+    fn extra_usage_falls_back_to_the_spend_block() {
+        // When `extra_usage` is absent the equivalent `spend` block supplies the
+        // same posture (used/limit money objects + `enabled`); the limit-reached
+        // flag is derived from used >= limit.
+        let body = r#"{
+            "five_hour": { "utilization": 10.0 },
+            "seven_day": { "utilization": 20.0 },
+            "spend": {
+                "used": { "amount_minor": 1500, "currency": "USD", "exponent": 2 },
+                "limit": { "amount_minor": 40000, "currency": "USD", "exponent": 2 },
+                "enabled": true
+            }
+        }"#;
+        let extra = parse_usage(body).unwrap().extra_usage.expect("fallback");
+        assert!(extra.is_enabled);
+        assert_eq!(extra.used_credits, 1500);
+        assert_eq!(extra.monthly_limit, Some(40000));
+        assert!(!extra.spend_limit_reached);
+        assert_eq!(extra.currency.as_deref(), Some("USD"));
+        assert_eq!(extra.decimal_places, 2);
+
+        let reached = r#"{
+            "five_hour": { "utilization": 10.0 },
+            "seven_day": { "utilization": 20.0 },
+            "spend": {
+                "used": { "amount_minor": 40000, "currency": "USD", "exponent": 2 },
+                "limit": { "amount_minor": 40000, "currency": "USD", "exponent": 2 },
+                "enabled": true
+            }
+        }"#;
+        assert!(
+            parse_usage(reached)
+                .unwrap()
+                .extra_usage
+                .unwrap()
+                .spend_limit_reached,
+            "used == limit derives spend_limit_reached"
+        );
+    }
+
+    #[test]
+    fn extra_usage_is_absent_when_neither_block_exists() {
+        let body = r#"{
+            "five_hour": { "utilization": 10.0 },
+            "seven_day": { "utilization": 20.0 }
+        }"#;
+        assert_eq!(parse_usage(body).unwrap().extra_usage, None);
     }
 
     #[test]
@@ -1225,6 +1534,8 @@ mod tests {
             weekly_all: 0.2,
             weekly_scoped: None,
             weekly_scoped_model: None,
+            weekly_scoped_resets_at: None,
+            extra_usage: None,
             session_resets_at: Some("2025-01-01T00:00:00Z".to_owned()),
             weekly_resets_at: Some("2025-06-26T18:00:00Z".to_owned()),
             session_severity: None,

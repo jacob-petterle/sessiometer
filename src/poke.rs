@@ -921,6 +921,8 @@ mod tests {
             health,
             // Bounded-blindness (#479) is not read by poke's verdict — inert here.
             blind_active: None,
+            // Nor the paid-extra-usage posture: display-only for poke.
+            extra_usage: None,
             // Nor is the #882 refresh-token expiry modifier: poke keys off the auth rollup, and the
             // expiry axis is orthogonal to it (surfaced, never acted upon).
             expiry: None,

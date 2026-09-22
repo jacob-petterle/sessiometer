@@ -123,7 +123,7 @@ use crate::stats::{FleetRunway, FleetRunwayState, FLEET_RUNWAY_PLAUSIBLE_MAX_SEC
 use crate::swap::{self, SwapDecision, SwapLock, SWAP_LOCK_MAX_WAIT};
 use crate::systemic_refresh::{PreflightHealth, SweepHealth, SystemicRefreshHealth};
 use crate::timing::{Jitter, Rng, SplitMix64, Strategy};
-use crate::usage::{CurlTransport, PolledReading, RealUsageSource, Usage, UsageSource};
+use crate::usage::{CurlTransport, ExtraUsage, PolledReading, RealUsageSource, Usage, UsageSource};
 use crate::usage_store::{append_sample, compact_and_roll, RetentionPolicy, Sample};
 
 // Per-concern submodules split off from this file along its responsibility seams (issue
@@ -732,6 +732,8 @@ fn append_sample_for_poll(
         reading.usage.weekly_scoped,
         reading.weekly_scoped_model.clone(),
     )
+    .with_weekly_scoped_reset(reading.weekly_scoped_resets_at)
+    .with_extra_usage(reading.extra_usage.clone())
     .with_spend(None);
     if let Err(err) = append_sample(samples_path, &sample) {
         eprintln!("sessiometer: usage-sample write skipped: {err}");
@@ -1368,6 +1370,11 @@ struct AccountRuntime {
     /// Whether this account has been polled at least once this run (issue #80). Drives the warm-up
     /// latch [`warmed_up`](DecisionState::warmed_up).
     polled_once: bool,
+    /// The account's latest paid-extra-usage posture ([`ExtraUsage`]) — sample-only data folded
+    /// in by the poll path beside [`last_reading`](Self::last_reading) (including the #162 / #282
+    /// re-poll retries) so `status --json` can carry it. Never a swap-decision input; `None`
+    /// until a poll reports one. Non-secret — amounts and flags only.
+    last_extra_usage: Option<ExtraUsage>,
 }
 
 /// Per-account decision helpers (issue #669, the final step of the #637 `daemon.rs`
@@ -2768,8 +2775,13 @@ where
             // swallowed and never perturbs the loop below.
             self.maintain_stats_store(i, polled.is_err(), wall_clock_now_secs(), &mut events);
             // Project to the lean `Usage` the decision path consumes; the sample-only
-            // `severity` does not travel past here.
-            let mut result = polled.map(|reading| reading.usage);
+            // `severity` does not travel past here. The extra-usage posture rides to the
+            // account's runtime slot so `status --json` can carry it (sample-only data —
+            // never a swap-decision input).
+            let mut result = polled.map(|reading| {
+                self.state.accounts[i].last_extra_usage = reading.extra_usage.clone();
+                reading.usage
+            });
             // Issue #162: a usage 401 is USUALLY a merely-expired access token, not a dead
             // credential. Before it counts toward the #42 death streak, attempt ONE isolated
             // refresh (the #102 engine) + a single re-poll — but only on the FIRST 401 of a
@@ -6462,6 +6474,8 @@ mod tests {
                     usage: *usage,
                     severity: None,
                     weekly_scoped_model: None,
+                    weekly_scoped_resets_at: None,
+                    extra_usage: None,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
@@ -7277,6 +7291,8 @@ mod tests {
                     usage: *usage,
                     severity: None,
                     weekly_scoped_model: None,
+                    weekly_scoped_resets_at: None,
+                    extra_usage: None,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
@@ -17253,6 +17269,7 @@ mod tests {
             blind_anchor,
             observation_gap,
             polled_once,
+            last_extra_usage,
         } = &daemon.state.accounts[1];
         assert!(observation_gap.is_some(), "its own anchor moved");
         assert_eq!(last_reading, &before.last_reading);
@@ -17262,6 +17279,7 @@ mod tests {
         assert_eq!(session_high_water, &before.session_high_water);
         assert_eq!(parked_landing, &before.parked_landing);
         assert_eq!(polled_once, &before.polled_once);
+        assert_eq!(last_extra_usage, &before.last_extra_usage);
         // `assert!` rather than `assert_eq!`: `AccountHealth` deliberately derives no `Debug`, and
         // this test is not a reason to give a credential-adjacent record a formatter.
         assert!(
@@ -19799,6 +19817,8 @@ mod tests {
             },
             severity: Some("critical".to_owned()),
             weekly_scoped_model: None,
+            weekly_scoped_resets_at: None,
+            extra_usage: None,
         });
 
         append_sample_for_poll(&samples_path, "work", &reading, 1_700_000_000);
@@ -19852,6 +19872,8 @@ mod tests {
             },
             severity: Some("critical".to_owned()),
             weekly_scoped_model: None,
+            weekly_scoped_resets_at: None,
+            extra_usage: None,
         });
         let authored = "alice@example.com";
 
@@ -19893,6 +19915,8 @@ mod tests {
             },
             severity: None,
             weekly_scoped_model: None,
+            weekly_scoped_resets_at: None,
+            extra_usage: None,
         });
 
         append_sample_for_poll(&samples_path, "spare", &reading, 42);
@@ -19933,6 +19957,8 @@ mod tests {
             },
             severity: None,
             weekly_scoped_model: None,
+            weekly_scoped_resets_at: None,
+            extra_usage: None,
         });
         append_sample_for_poll(&samples_path, "work", &ok, 200);
         let transient: Result<PolledReading> = Err(Error::UsageTransient {
@@ -19971,6 +19997,8 @@ mod tests {
             },
             severity: Some("warning".to_owned()),
             weekly_scoped_model: None,
+            weekly_scoped_resets_at: None,
+            extra_usage: None,
         });
 
         // Must NOT panic / unwind: reaching the assertion below proves the write

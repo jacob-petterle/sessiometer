@@ -3785,6 +3785,7 @@ mod tests {
         Option<BlindAnchor>,
         Option<ObservationGapAnchor>,
         bool,
+        Option<crate::usage::ExtraUsage>,
     ) {
         let AccountRuntime {
             health,
@@ -3796,6 +3797,7 @@ mod tests {
             blind_anchor,
             observation_gap,
             polled_once,
+            last_extra_usage,
         } = account;
         (
             (
@@ -3811,6 +3813,7 @@ mod tests {
             *blind_anchor,
             *observation_gap,
             *polled_once,
+            last_extra_usage.clone(),
         )
     }
 

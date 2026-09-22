@@ -439,6 +439,10 @@ where
                     weekly_exhausted: readings[i]
                         .is_some_and(|usage| usage.weekly >= self.weekly_rotation_line()),
                     usage: readings[i],
+                    // The paid-extra-usage posture the last successful poll folded in
+                    // (sample-only data — `status --json` carries it, the decision path
+                    // never reads it). `None` until a poll reports one.
+                    extra_usage: self.state.accounts[i].last_extra_usage.clone(),
                     // The credential clocks + the daemon-computed 5-state rollup (issue
                     // #119), projected from this account's carried health state. The
                     // rollup is computed HERE (daemon-side) against `now_secs`; the thin

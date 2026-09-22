@@ -9285,6 +9285,7 @@ spare  22222222-2222\n\
             refresh_health: None,
             health: None,
             blind_active: None,
+            extra_usage: None,
             // No observed refresh-token deadline, so the issue #883 `EXPIRY` column elides and
             // every layout / alignment / colouring test below keeps pinning the pre-#883 table.
             // The column's own tests build their lines with `status_line_expiry`.
@@ -9360,6 +9361,7 @@ spare  22222222-2222\n\
             refresh_health: None,
             health: None,
             blind_active: None,
+            extra_usage: None,
             expiry: None,
         }
     }
@@ -16824,6 +16826,7 @@ impl Nested {
                 refresh_health: None,
                 health: None,
                 blind_active: None,
+                extra_usage: None,
                 // No observed refresh-token deadline, so the issue #883 `EXPIRY` column elides on
                 // the empty-column rule and every committed CLI-render golden stays byte-identical.
                 // Keep it that way: issue #886 settled this the OTHER way round — populating the

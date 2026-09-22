@@ -624,6 +624,39 @@ struct AccountExpiry: Decodable, Equatable, Sendable {
     }
 }
 
+// MARK: - The paid extra-usage posture
+
+/// The account's paid-extra-usage posture — mirrors the daemon's `ExtraUsage`
+/// (`src/usage.rs`), wire key `extra_usage` on each account line, present only once a poll
+/// has reported one (the daemon omits the key otherwise — the additive MINOR 1.14 → 1.15).
+/// When enabled, an account at 100 % weekly bills credits rather than blocking; the panel
+/// can surface that as a credits chip. `monthlyLimit` / `currency` are optional inside a
+/// PRESENT object (the `spend`-fallback shape may lack them); the rest are required —
+/// non-secret throughout (amounts and flags only, never an identifier).
+struct ExtraUsage: Decodable, Equatable, Sendable {
+    /// Whether paid extra usage is enabled (`is_enabled`).
+    let isEnabled: Bool
+    /// Credits consumed so far this month, in minor units of `currency` (`used_credits`).
+    let usedCredits: Int64
+    /// The monthly credit limit in minor units, when reported (`monthly_limit`).
+    let monthlyLimit: Int64?
+    /// Whether the spend limit has been reached (`spend_limit_reached`).
+    let spendLimitReached: Bool
+    /// ISO-style currency code (e.g. `"USD"`), when reported.
+    let currency: String?
+    /// Decimal places the minor-unit amounts are expressed in (`decimal_places`).
+    let decimalPlaces: UInt8
+
+    private enum CodingKeys: String, CodingKey {
+        case isEnabled = "is_enabled"
+        case usedCredits = "used_credits"
+        case monthlyLimit = "monthly_limit"
+        case spendLimitReached = "spend_limit_reached"
+        case currency
+        case decimalPlaces = "decimal_places"
+    }
+}
+
 // MARK: - The redacted per-account payload line
 
 /// One account's redacted status line (`src/daemon/snapshot.rs` `AccountStatusLine`) — a
@@ -675,6 +708,9 @@ struct AccountStatusLine: Decodable, Equatable {
     /// Distinct from `accessExpiresAt`: that is the ACCESS token Claude Code refreshes invisibly; this
     /// is the REFRESH token — the login itself — and no refresh moves it. Two different clocks.
     let expiry: AccountExpiry?
+    /// The paid-extra-usage posture, wire key `extra_usage`; present only once a poll has
+    /// reported one (the daemon omits the key otherwise — additive minor 1.14 → 1.15). Display-only.
+    let extraUsage: ExtraUsage?
 
     private enum CodingKeys: String, CodingKey {
         case label
@@ -692,6 +728,7 @@ struct AccountStatusLine: Decodable, Equatable {
         case auth
         case blindActive = "blind_active"
         case expiry
+        case extraUsage = "extra_usage"
     }
 
     init(from decoder: Decoder) throws {
@@ -711,6 +748,7 @@ struct AccountStatusLine: Decodable, Equatable {
         auth = try c.decodeIfPresent(CredentialHealth.self, forKey: .auth)
         blindActive = try c.decodeIfPresent(BlindActive.self, forKey: .blindActive)
         expiry = try c.decodeIfPresent(AccountExpiry.self, forKey: .expiry)
+        extraUsage = try c.decodeIfPresent(ExtraUsage.self, forKey: .extraUsage)
     }
 }
 
