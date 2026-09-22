@@ -193,6 +193,10 @@ enum DaemonAction {
     /// `daemon restart` — restart the running daemon. Managed → `launchctl kickstart -k`;
     /// unmanaged → a clear error (nothing supervises a bare `run` to respawn it).
     Restart,
+    /// `daemon reload` — ask the running daemon to re-read `config.toml` and hot-apply the
+    /// reloadable swap tunables (plus any roster additions) in place, no restart. Declared
+    /// [`ReloadIntent::AppendOnly`] — this verb never shrinks the roster.
+    Reload,
 }
 
 /// The `config` sub-action (issues #401, #1439): config diagnostics, plus the backup ring's
@@ -432,6 +436,7 @@ fn parse_daemon(parser: &mut lexopt::Parser) -> Result<Command> {
                     "status" => DaemonAction::Status,
                     "stop" => DaemonAction::Stop,
                     "restart" => DaemonAction::Restart,
+                    "reload" => DaemonAction::Reload,
                     other => {
                         return Err(Error::CliUsage {
                             message: format!("unknown daemon action `{other}`"),
@@ -887,6 +892,7 @@ async fn execute(command: Command) -> Result<()> {
             DaemonAction::Status => daemon_status().await,
             DaemonAction::Stop => daemon_stop().await,
             DaemonAction::Restart => daemon_restart().await,
+            DaemonAction::Reload => daemon_reload().await,
         },
         Command::Config { action } => match action {
             ConfigAction::Path => config_path(),
@@ -1069,11 +1075,12 @@ safety guard — nothing bypasses it.
 const DAEMON_USAGE: &str = "sessiometer daemon — the running daemon process: report it, stop it, restart it (process lifecycle)
 
 USAGE:
-    sessiometer daemon <status|stop|restart>
+    sessiometer daemon <status|stop|restart|reload>
 
     status      report whether a daemon is running, and whether it is managed (launchd) or unmanaged (a foreground / detached `sessiometer run`)
     stop        stop the running daemon now — managed: launchctl bootout; unmanaged: a graceful control-socket shutdown (an in-flight swap completes first)
     restart     restart a managed daemon (launchctl kickstart -k); an unmanaged daemon has no restart (see below)
+    reload      re-read config.toml in place — hot-apply the reloadable swap tunables and roster additions, no restart
     -h, --help  print this help
 
 `daemon` is the process-lifecycle counterpart to `service` (which owns the launchd
@@ -1607,6 +1614,8 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
         target_max_session_usage: config.tunables.target_max_session_usage,
         session_ceiling: config.tunables.session_ceiling,
         weekly_ceiling: config.tunables.weekly_ceiling,
+        weekly_tail_margin_pct: config.tunables.weekly_tail_margin_pct,
+        target_policy: config.tunables.target_policy.as_str(),
         monitor_401_n: config.tunables.monitor_401_n,
         monitor_recovery_m: config.tunables.monitor_recovery_m,
     });
@@ -2170,6 +2179,21 @@ async fn daemon_restart() -> Result<()> {
         RestartPlan::RefuseUnmanaged => Err(Error::UnmanagedDaemonNoRestart),
         RestartPlan::RefuseNoService => Err(Error::NoManagedService),
     }
+}
+
+/// Ask the running daemon to re-read `config.toml` in place (`daemon reload`): the same
+/// roster-reload signal the roster verbs send, declared [`ReloadIntent::AppendOnly`] — it
+/// hot-applies the reloadable swap tunables and any roster additions, and can never shrink
+/// the roster. Best-effort like every other notify: the outcome (adopted / refused /
+/// `tunables_reload`) lands on the durable event log, which is also where an operator
+/// confirms it.
+async fn daemon_reload() -> Result<()> {
+    crate::capture::notify_daemon_roster_reload(crate::daemon::ReloadIntent::AppendOnly).await;
+    println!(
+        "sessiometer: reload signaled; the daemon logs roster_reload and tunables_reload \
+         events with the outcome"
+    );
+    Ok(())
 }
 
 /// Ask a running UNMANAGED daemon to stop over its control socket (issue #397): connect, send the
@@ -3288,6 +3312,7 @@ fn render_next_swap(next_swap: Option<&NextSwap>, now: i64) -> String {
         Some(NextSwap::Target { to, reason }) => {
             let why = match reason {
                 Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
+                Some(NextSwapReason::FullestWeekly { .. }) => " (fullest weekly)",
                 Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
                 Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
                 None => "",
@@ -14341,6 +14366,7 @@ spare  22222222-2222\n\
         ("socket_shutdown", NotRendered, "interpolates its two callers' words; `daemon_stop` authors them"),
         ("status", NotRendered, "interpolates the serialized `--json` snapshot"),
         // --- operator-facing, and no framing scan reaches it (issue #1167) ---------------------
+        ("daemon_reload", Unscanned, "the `daemon reload` acknowledgment line — the outcome itself lands on the durable log it names"),
         ("access_token_expiry_cell", Unscanned, "the `-v` access-token clock's three states"),
         ("expiry_cell", Unscanned, "the EXPIRY column's `lapsed` state"),
         ("expiry_tag", Unscanned, "`list`'s expiry tag"),
@@ -14427,21 +14453,21 @@ spare  22222222-2222\n\
         // catches a second same-named function, since the register keys on the name alone.
         assert_eq!(
             spelled.len(),
-            79,
-            "expected 79 functions spelling an inline word-bearing literal; the count moved — \
+            80,
+            "expected 80 functions spelling an inline word-bearing literal; the count moved — \
              disposition the new one, then update this"
         );
         assert_eq!(
             literals.len(),
-            288,
-            "expected 288 inline word-bearing literals; the count moved — check whether the \
+            291,
+            "expected 291 inline word-bearing literals; the count moved — check whether the \
              function that gained one is still dispositioned correctly, then update this"
         );
 
         // Per-arm cardinality, so the DEBT is pinned rather than merely listed: a surface moved
-        // into `Unscanned` without anyone deciding to would otherwise land silently among 44
+        // into `Unscanned` without anyone deciding to would otherwise land silently among 45
         // entries that already say so. Shrinking this number is the progress issue #1167 tracks.
-        for (arm, expected) in [(Scanned, 11), (NotRendered, 24), (Unscanned, 44)] {
+        for (arm, expected) in [(Scanned, 11), (NotRendered, 24), (Unscanned, 45)] {
             let actual = INLINE_PROSE_REGISTER
                 .iter()
                 .filter(|(_, disposition, _)| *disposition == arm)

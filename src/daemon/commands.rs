@@ -678,6 +678,11 @@ where
         };
         match Config::load_path(&path) {
             Ok(config) => {
+                // Hot-apply the swap tunables alongside the roster reconcile (independent of
+                // the roster's verdict — a refused shrink must not also refuse a tunables
+                // edit). Any change queues its `tunables_reload` event on
+                // `pending_events`, drained by the run loop beside this one.
+                self.adopt_tunables(&config.tunables);
                 // Read before `reconcile_roster` takes the roster by value.
                 let incoming = Some(config.roster.len());
                 // The never-shrink floor (issue #1442) lives INSIDE the reconcile, so this arm
@@ -717,6 +722,91 @@ where
                     _ => RosterReloadReason::Unreadable,
                 }),
             },
+        }
+    }
+
+    /// Hot-apply the reloadable swap tunables from a freshly-loaded `config` onto the live
+    /// daemon: `session_ceiling` (base + jitter strategy), `weekly_ceiling` (base + strategy),
+    /// `target_max_session_usage`, `weekly_tail_margin_pct`, and `target_policy`. Everything
+    /// else stays restart-only — poll cadences, refresh, the canary switches are not touched.
+    ///
+    /// Runs on EVERY successful `Config::load_path` inside [`Self::adopt_roster_reload`],
+    /// regardless of the roster reconcile's verdict — a refused shrink must not also refuse
+    /// a tunables edit. Every derived line re-derives from these fields at read time
+    /// (`weekly_rotation_line`, the per-cycle `decide` draw, the viability boundary), so no
+    /// cached threshold survives a change here.
+    ///
+    /// Changed keys are reported as ONE durable `Event::TunablesReload` queued on
+    /// `pending_events`, rendered `key=old→new`; an unchanged config queues nothing.
+    fn adopt_tunables(&mut self, t: &Tunables) {
+        let mut changes: Vec<String> = Vec::new();
+        // Ceiling bases are reported in their config units (percents), not the stored fraction.
+        let mut ceiling = |key: &'static str,
+                           jitter_key: &'static str,
+                           base: &mut f64,
+                           strategy: &mut Strategy,
+                           new_pct: u8,
+                           new_strategy: Strategy| {
+            let new_base = f64::from(new_pct) / 100.0;
+            if *base != new_base {
+                changes.push(format!("{key}={}→{new_pct}", to_pct(*base)));
+            }
+            if *strategy != new_strategy {
+                changes.push(format!(
+                    "{jitter_key}={}→{}",
+                    crate::config::render_jitter(&strategy.jitter),
+                    crate::config::render_jitter(&new_strategy.jitter),
+                ));
+            }
+            *base = new_base;
+            *strategy = new_strategy;
+        };
+        ceiling(
+            "session_ceiling",
+            "session_ceiling_jitter",
+            &mut self.session_ceiling_base,
+            &mut self.session_ceiling_strategy,
+            t.session_ceiling,
+            t.session_ceiling_strategy,
+        );
+        ceiling(
+            "weekly_ceiling",
+            "weekly_ceiling_jitter",
+            &mut self.weekly_ceiling_base,
+            &mut self.weekly_ceiling_strategy,
+            t.weekly_ceiling,
+            t.weekly_ceiling_strategy,
+        );
+        let new_target_max = f64::from(t.target_max_session_usage) / 100.0;
+        if self.target_max_session_usage != new_target_max {
+            changes.push(format!(
+                "target_max_session_usage={}→{}",
+                to_pct(self.target_max_session_usage),
+                t.target_max_session_usage,
+            ));
+            self.target_max_session_usage = new_target_max;
+        }
+        let new_margin = f64::from(t.weekly_tail_margin_pct) / 100.0;
+        if self.weekly_tail_margin != new_margin {
+            changes.push(format!(
+                "weekly_tail_margin_pct={}→{}",
+                to_pct(self.weekly_tail_margin),
+                t.weekly_tail_margin_pct,
+            ));
+            self.weekly_tail_margin = new_margin;
+        }
+        if self.target_policy != t.target_policy {
+            changes.push(format!(
+                "target_policy={}→{}",
+                self.target_policy.as_str(),
+                t.target_policy.as_str(),
+            ));
+            self.target_policy = t.target_policy;
+        }
+        if !changes.is_empty() {
+            self.pending_events.push(Event::TunablesReload {
+                changes: changes.join(" "),
+            });
         }
     }
 
@@ -4465,6 +4555,182 @@ mod tests {
             matches!(pairing(&adopted).0, RosterReloadOutcome::Adopted),
             "canary: the adopted path did not adopt, so the only row that can carry the forbidden \
              pairing was never exercised: {adopted:?}"
+        );
+    }
+
+    /// A `write_roster_config` variant that splices a `[tunables]` fragment in BEFORE the
+    /// `[[account]]` tables (TOML binds bare keys to the last-opened table, so the order is
+    /// load-bearing) — the fixture for the hot-apply tests: the same `Config::load_path` read
+    /// `adopt_roster_reload` takes, exercising real keys rather than a constructed `Tunables`.
+    fn write_tunables_reload_config(path: &Path, accounts: &[(&str, &str)], tunables: &str) {
+        let mut toml = String::new();
+        if !tunables.is_empty() {
+            toml.push_str("[tunables]\n");
+            toml.push_str(tunables);
+            toml.push('\n');
+        }
+        for (uuid, label) in accounts {
+            toml.push_str(&format!(
+                "[[account]]\naccount_uuid = \"{uuid}\"\nlabel = \"{label}\"\nenabled = true\n\n"
+            ));
+        }
+        std::fs::write(path, toml).unwrap();
+    }
+
+    /// Read the single queued `tunables_reload` event's rendered line, or fail loudly —
+    /// the reload tests' shared extraction so each asserts on the emitted grammar.
+    fn tunables_reload_line(daemon: &mut FakeDaemon) -> String {
+        let pending = daemon.take_pending_events();
+        match pending.as_slice() {
+            [event @ Event::TunablesReload { .. }] => event.to_log_line(std::time::UNIX_EPOCH),
+            other => panic!("expected exactly one TunablesReload event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reload_hot_applies_tunables_and_reports_only_the_changed_keys() {
+        // A config edit + `adopt_roster_reload` moves the live daemon's swap tunables WITHOUT a
+        // restart: the margin and policy fields update, the derived weekly rotation line moves
+        // with the new margin (no cached threshold survives), and ONE `tunables_reload` event
+        // names exactly the keys that changed.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_tunables_reload_config(
+            &config_path,
+            &[("u-A", "work")],
+            "weekly_tail_margin_pct = 0\ntarget_policy = \"fullest_weekly\"\n",
+        );
+        // `reconcile_daemon`'s fixture carries the shipping defaults (session 95 / floor 80 /
+        // weekly 98 / margin 1 / soonest_reset), so the fragment above changes exactly two keys.
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path);
+        assert!((daemon.weekly_rotation_line() - 0.97).abs() < 1e-9);
+
+        let event = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
+        assert!(
+            matches!(
+                event,
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Adopted,
+                    ..
+                }
+            ),
+            "a same-roster reload adopts: {event:?}"
+        );
+
+        let line = tunables_reload_line(&mut daemon);
+        assert_eq!(field_of(&line, "event"), Some("tunables_reload"), "{line}");
+        assert!(line.contains("weekly_tail_margin_pct=1→0"), "{line}");
+        assert!(
+            line.contains("target_policy=soonest_reset→fullest_weekly"),
+            "{line}"
+        );
+        for unchanged in [
+            "session_ceiling",
+            "weekly_ceiling",
+            "target_max_session_usage",
+        ] {
+            assert!(
+                !line.contains(unchanged),
+                "only changed keys may be listed ({unchanged} appeared): {line}"
+            );
+        }
+        assert_eq!(daemon.weekly_tail_margin, 0.0);
+        assert_eq!(daemon.target_policy, TargetPolicy::FullestWeekly);
+        // The cached-line requirement: the derived line moved with the field — 0.98 − 0.00.
+        assert_eq!(daemon.weekly_rotation_line(), 0.98);
+    }
+
+    #[tokio::test]
+    async fn a_reload_with_unchanged_tunables_emits_no_tunables_event() {
+        // The no-change half of the contract: a reload whose tunables match the daemon's current
+        // values adopts the roster but queues NO `tunables_reload` line.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        // Every adopted key at the `reconcile_daemon` fixture's own values.
+        write_tunables_reload_config(
+            &config_path,
+            &[("u-A", "work")],
+            "session_ceiling = 95\ntarget_max_session_usage = 80\nweekly_ceiling = 98\n\
+             weekly_tail_margin_pct = 1\ntarget_policy = \"soonest_reset\"\n",
+        );
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path);
+        let event = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
+        assert!(
+            matches!(
+                event,
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Adopted,
+                    ..
+                }
+            ),
+            "{event:?}"
+        );
+        assert!(
+            daemon.take_pending_events().is_empty(),
+            "an unchanged config must emit no tunables_reload event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_shrink_still_hot_applies_the_tunables() {
+        // The verdict-independence requirement: `RefusedShrink` declines the ROSTER, not the
+        // config — a tunables edit riding a shrink attempt still applies, and its event still
+        // emits, because refusing both would let a malformed roster freeze the tunables too.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_tunables_reload_config(
+            &config_path,
+            &[("u-A", "work")],
+            "target_max_session_usage = 70\n",
+        );
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
+                .with_config_path(config_path);
+
+        let event = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
+        assert!(
+            matches!(
+                event,
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Refused,
+                    ..
+                }
+            ),
+            "two live accounts, one on disk, append-only intent → refused: {event:?}"
+        );
+        assert_eq!(roster_uuids(&daemon).len(), 2, "the roster was refused");
+
+        let line = tunables_reload_line(&mut daemon);
+        assert_eq!(field_of(&line, "event"), Some("tunables_reload"), "{line}");
+        assert!(line.contains("target_max_session_usage=80→70"), "{line}");
+        assert_eq!(daemon.target_max_session_usage, 0.70);
+    }
+
+    #[tokio::test]
+    async fn a_reload_hot_applies_the_jitter_strategies() {
+        // The ceiling strategies are part of the adopted set: a `[jitter]` change lands on the
+        // live strategy (the per-cycle draw reads it) and is reported under its own key.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let toml = "[jitter]\nweekly_ceiling = { kind = \"uniform\", spread = 2.0 }\n\n\
+                    [[account]]\naccount_uuid = \"u-A\"\nlabel = \"work\"\nenabled = true\n";
+        std::fs::write(&config_path, toml).unwrap();
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path);
+
+        let _ = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
+        let line = tunables_reload_line(&mut daemon);
+        assert!(line.contains("weekly_ceiling_jitter="), "{line}");
+        assert!(line.contains("uniform"), "{line}");
+        assert!(
+            matches!(
+                daemon.weekly_ceiling_strategy.jitter,
+                crate::timing::Jitter::Uniform { spread } if (spread - 2.0).abs() < 1e-9
+            ),
+            "the live weekly strategy took the configured jitter: {:?}",
+            daemon.weekly_ceiling_strategy
         );
     }
 

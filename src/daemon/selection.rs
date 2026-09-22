@@ -73,6 +73,7 @@ pub(crate) fn pick_target(
     floor: Option<f64>,
     session_ceiling: f64,
     weekly_ceiling: f64,
+    policy: TargetPolicy,
 ) -> Option<usize> {
     // The index-only projection for the callers that need no rationale (the swap decision, the
     // refresh exclusions). [`pick_target_with_reason`] is the single source of selection truth;
@@ -84,6 +85,7 @@ pub(crate) fn pick_target(
         floor,
         session_ceiling,
         weekly_ceiling,
+        policy,
     )
     .map(|(i, _)| i)
 }
@@ -106,6 +108,12 @@ pub(crate) struct SelectionTiebreak<'a> {
     /// axes (velocity preference, then per-daemon jitter); `None` degrades selection to exactly the
     /// pre-#612 soonest-reset + roster-index order (velocity ignored, un-jittered).
     pub(super) seed: Option<u64>,
+    /// The configured `[tunables] target_policy`: which axis dominates AMONG the viable set.
+    /// `SoonestReset` is the issue #37 behaviour; `FullestWeekly` ranks by weekly usage
+    /// descending and demotes the reset chain (plus these tie-break axes) to the tiebreak.
+    /// Bundled here rather than as a separate parameter so the ranked selectors stay within
+    /// the repo's 7-argument clippy bound.
+    pub(super) policy: TargetPolicy,
 }
 
 /// Like [`pick_target`], but velocity-aware and per-daemon jittered (issue #612): the index-only
@@ -174,6 +182,7 @@ pub(crate) fn pick_target_with_reason(
     floor: Option<f64>,
     session_ceiling: f64,
     weekly_ceiling: f64,
+    policy: TargetPolicy,
 ) -> Option<(usize, NextSwapReason)> {
     pick_target_with_reason_ranked(
         active,
@@ -185,6 +194,7 @@ pub(crate) fn pick_target_with_reason(
         SelectionTiebreak {
             accounts: &[],
             seed: None,
+            policy,
         },
     )
 }
@@ -264,30 +274,43 @@ pub(crate) fn pick_target_with_reason_ranked(
     let (idx, usage) = viable.into_iter().min_by(|&(a_idx, a), &(b_idx, b)| {
         let a_reset = a.weekly_resets_at.map_or((true, i64::MAX), |r| (false, r));
         let b_reset = b.weekly_resets_at.map_or((true, i64::MAX), |r| (false, r));
-        a_reset
-            .cmp(&b_reset)
-            // Both #612 axes, gated ONCE on the per-daemon seed: velocity first (a lower retained
-            // session-velocity EMA wins a reset tie — a steep climber would re-trip the session
-            // dimension soon after a swap TO it), then the jitter key to disperse the cross-machine
-            // co-selection herd on a remaining tie (a fixed per-daemon seed keeps it stable across
-            // ticks). `None` is the legacy path: both inert, straight to the roster index below.
-            .then_with(|| match sel.seed {
-                Some(seed) => velocity_rate(sel.accounts, a_idx)
-                    .total_cmp(&velocity_rate(sel.accounts, b_idx))
-                    .then_with(|| {
-                        selection_tiebreak_key(seed, a_idx)
-                            .cmp(&selection_tiebreak_key(seed, b_idx))
-                    }),
-                None => std::cmp::Ordering::Equal,
-            })
-            // The earliest roster index — the pre-#612 tie-break, and the only one legacy uses.
-            .then_with(|| a_idx.cmp(&b_idx))
+        let reset_order = a_reset.cmp(&b_reset);
+        // The DOMINANT axis is the configured policy: `SoonestReset` leads with the issue #37
+        // reset chain as today; `FullestWeekly` leads with weekly usage DESCENDING (spend the
+        // fullest account's remaining sliver first) and demotes the reset chain to the
+        // tiebreak, ahead of the #612 axes.
+        match sel.policy {
+            TargetPolicy::FullestWeekly => b.weekly.total_cmp(&a.weekly).then(reset_order),
+            TargetPolicy::SoonestReset => reset_order,
+        }
+        // Both #612 axes, gated ONCE on the per-daemon seed: velocity first (a lower retained
+        // session-velocity EMA wins a reset tie — a steep climber would re-trip the session
+        // dimension soon after a swap TO it), then the jitter key to disperse the cross-machine
+        // co-selection herd on a remaining tie (a fixed per-daemon seed keeps it stable across
+        // ticks). `None` is the legacy path: both inert, straight to the roster index below.
+        .then_with(|| match sel.seed {
+            Some(seed) => velocity_rate(sel.accounts, a_idx)
+                .total_cmp(&velocity_rate(sel.accounts, b_idx))
+                .then_with(|| {
+                    selection_tiebreak_key(seed, a_idx).cmp(&selection_tiebreak_key(seed, b_idx))
+                }),
+            None => std::cmp::Ordering::Equal,
+        })
+        // The earliest roster index — the pre-#612 tie-break, and the only one legacy uses.
+        .then_with(|| a_idx.cmp(&b_idx))
     })?;
     // The reason names the axis that ACTUALLY discriminated the winner — never a rule the daemon
     // did not apply (that inversion is the #393 bug itself). Three genuinely distinct states.
     let reason = if candidate_count < 2 {
         // Sole viable target: there was nothing to compare it against, so no axis decided.
         NextSwapReason::OnlyCandidate
+    } else if sel.policy == TargetPolicy::FullestWeekly {
+        // ≥2 viable under fullest-weekly: the winner sits at the maximum weekly reading (a tie
+        // there falls to the demoted reset chain, but the winner is still "a fullest" — the axis
+        // it reports is the one that nominated it).
+        NextSwapReason::FullestWeekly {
+            weekly_pct: to_pct(usage.weekly),
+        }
     } else if let Some(resets_at) = usage.weekly_resets_at {
         // ≥2 viable and the winner holds the soonest KNOWN reset — issue #37's axis, carried as
         // the very `min_by_key` key that selected it (previously computed, then discarded).
@@ -319,6 +342,10 @@ mod tests {
     // viable winner's session below it, so the gate is a no-op for them; the dedicated
     // `pick_target_excludes_session_saturated_accounts` test exercises it.
     const SESS: f64 = 0.95;
+
+    // The default selection policy for every pre-policy test below — the issue #37 axis, which
+    // `fullest_weekly` deliberately does NOT share. The fullest-weekly tests pass their own.
+    const SOONEST: TargetPolicy = TargetPolicy::SoonestReset;
 
     /// An all-enabled flag slice sized to `readings` (issue #36): the pre-#36
     /// pick_target tests pin the floor / selection / weekly-exhaustion behavior with
@@ -368,7 +395,15 @@ mod tests {
         // Index 1 (reset 200) beats the most-headroom index 2 (reset 500); index 0 is
         // active and index 3 fails the floor, so neither earlier reset is eligible.
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
             Some(1)
         );
     }
@@ -406,8 +441,164 @@ mod tests {
             }), // more headroom, but later reset
         ];
         assert_eq!(
-            pick_target_with_reason(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            pick_target_with_reason(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
             Some((1, NextSwapReason::SoonestReset { resets_at: 200 })),
+        );
+    }
+
+    /// One `Usage` fixture for the fullest-weekly tests: `session` parked far below every gate,
+    /// `weekly` + `weekly_resets_at` set per case.
+    fn weekly_reading(weekly: f64, resets_at: Option<i64>) -> Option<Usage> {
+        Some(Usage {
+            session: 0.10,
+            weekly,
+            weekly_all: weekly,
+            weekly_scoped: None,
+            weekly_resets_at: resets_at,
+            session_resets_at: None,
+        })
+    }
+
+    #[test]
+    fn pick_target_fullest_weekly_prefers_the_highest_weekly_reading() {
+        // `fullest_weekly` inverts the fixture's winning axis: under `soonest_reset` index 1 wins
+        // on its earliest reset (200) despite the least weekly usage; under `fullest_weekly`
+        // index 2's 85% reading wins despite the LATEST reset — the point of the policy is to
+        // spend the fullest account's remaining sliver first.
+        let readings = vec![
+            weekly_reading(0.10, Some(100)), // active
+            weekly_reading(0.30, Some(200)), // soonest reset, but least weekly usage
+            weekly_reading(0.85, Some(500)), // fullest weekly — wins under the policy
+            weekly_reading(0.60, Some(300)),
+        ];
+        let fullest = TargetPolicy::FullestWeekly;
+        assert_eq!(
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                fullest
+            ),
+            Some(2)
+        );
+        // Same inputs under `soonest_reset` pick exactly what the pre-policy code picks — the
+        // policy is the ONLY changed input, so the divergence is attributable to it alone.
+        assert_eq!(
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pick_target_with_reason_fullest_weekly_reports_the_winner_weekly() {
+        // The wire reason names the axis that nominated the winner AND carries its weekly
+        // reading in whole percents — `status` renders it as " (fullest weekly)".
+        let readings = vec![
+            weekly_reading(0.10, Some(100)), // active
+            weekly_reading(0.30, Some(200)),
+            weekly_reading(0.85, Some(500)),
+        ];
+        assert_eq!(
+            pick_target_with_reason(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                TargetPolicy::FullestWeekly,
+            ),
+            Some((2, NextSwapReason::FullestWeekly { weekly_pct: 85 })),
+        );
+    }
+
+    #[test]
+    fn pick_target_fullest_weekly_falls_to_soonest_reset_on_a_weekly_tie() {
+        // A tie on the dominant axis hands off to the demoted reset chain FIRST (known before
+        // unknown, then soonest epoch): both candidates sit at 60% weekly, so the reset 300
+        // account wins over the reset 500 one.
+        let readings = vec![
+            weekly_reading(0.10, Some(100)), // active
+            weekly_reading(0.60, Some(500)),
+            weekly_reading(0.60, Some(300)), // same weekly — soonest reset takes the tie
+        ];
+        assert_eq!(
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                TargetPolicy::FullestWeekly,
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn pick_target_fullest_weekly_keeps_only_candidate_semantics() {
+        // One viable target under `fullest_weekly` is still `OnlyCandidate` — no axis decided
+        // anything, so the reason must not fabricate a `FullestWeekly` rationale.
+        let readings = vec![
+            weekly_reading(0.10, Some(100)), // active
+            weekly_reading(0.85, Some(500)), // the only viable target
+            weekly_reading(0.99, Some(200)), // weekly-exhausted (>= WK) — filtered out
+        ];
+        assert_eq!(
+            pick_target_with_reason(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                TargetPolicy::FullestWeekly,
+            ),
+            Some((1, NextSwapReason::OnlyCandidate)),
+        );
+    }
+
+    #[test]
+    fn pick_target_admits_a_99_reading_but_not_100_at_the_zero_margin_line() {
+        // The ceiling-100 + margin-0 pairing's viability half: `weekly_ceiling` is 1.00 and the
+        // filter stays `usage.weekly < weekly_ceiling`, so a 99% weekly target is still a viable
+        // landing while a 100% one is not.
+        let readings = vec![
+            weekly_reading(0.10, Some(100)), // active
+            weekly_reading(0.99, Some(500)), // viable — 0.99 < 1.00
+            weekly_reading(1.00, Some(200)), // exhausted — not < 1.00
+        ];
+        assert_eq!(
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                1.0,
+                SOONEST
+            ),
+            Some(1)
         );
     }
 
@@ -436,7 +627,15 @@ mod tests {
             }), // the only viable candidate
         ];
         assert_eq!(
-            pick_target_with_reason(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            pick_target_with_reason(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
             Some((2, NextSwapReason::OnlyCandidate)),
         );
     }
@@ -475,7 +674,15 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target_with_reason(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            pick_target_with_reason(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
             Some((1, NextSwapReason::RosterOrder)),
         );
     }
@@ -502,7 +709,15 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
             Some(2)
         );
     }
@@ -536,7 +751,15 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
             None
         );
     }
@@ -573,7 +796,15 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
             Some(1)
         );
     }
@@ -610,7 +841,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK, SOONEST),
             Some(2)
         );
     }
@@ -647,7 +878,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK, SOONEST),
             Some(1)
         );
     }
@@ -690,7 +921,7 @@ mod tests {
         // Floor OFF: index 1 is still excluded by the always-on session gate (0.95 is
         // NOT < 0.95), so the session-fresh index 2 wins despite its later reset.
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK, SOONEST),
             Some(2)
         );
     }
@@ -729,12 +960,20 @@ mod tests {
         ];
         // Floor OFF → index 1 clears the gate (0.85 < 0.95) and wins on soonest reset…
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK, SOONEST),
             Some(1)
         );
         // …whereas an enabled 80% floor excludes index 1 (0.85 >= 0.80) and falls to index 2.
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            pick_target(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SOONEST
+            ),
             Some(2)
         );
     }
@@ -771,7 +1010,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK, SOONEST),
             Some(2)
         );
     }
@@ -787,7 +1026,8 @@ mod tests {
         // states as "the acquire predicate is at least as strict as the negation of the release
         // predicate on BOTH dimensions". The session dimension closes the same gap with the
         // `target_max_session_usage` reserve (#398); weekly has no such reserve, hence this.
-        let weekly_threshold = crate::swap::weekly_effective_ceiling(WK); // 0.97 at the 0.98 default
+        let weekly_threshold =
+            crate::swap::weekly_effective_ceiling(WK, crate::swap::WEEKLY_TAIL_MARGIN); // 0.97 at the 0.98 default
         let readings = vec![
             Some(Usage {
                 session: 0.50,
@@ -823,7 +1063,8 @@ mod tests {
                 &all_on(&readings),
                 None,
                 SESS,
-                weekly_threshold
+                weekly_threshold,
+                SOONEST,
             ),
             Some(2),
             "an account inside the weekly tail-margin band is not a viable target",
@@ -832,7 +1073,7 @@ mod tests {
         // thrash this lockstep prevents. If a future change reverts `decide_action` to passing the
         // raw ceiling here, this documents what breaks.
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK, SOONEST),
             Some(1),
             "against the raw ceiling the band account would be selected — the thrash case",
         );
@@ -869,7 +1110,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK, SOONEST),
             None
         );
     }
@@ -905,7 +1146,10 @@ mod tests {
             }),
         ];
         let enabled = [true, false, true]; // …but index 1 is parked
-        assert_eq!(pick_target(0, &readings, &enabled, None, SESS, WK), Some(2));
+        assert_eq!(
+            pick_target(0, &readings, &enabled, None, SESS, WK, SOONEST),
+            Some(2)
+        );
     }
 
     #[test]
@@ -940,7 +1184,10 @@ mod tests {
             }),
         ];
         let enabled = [true, true, false];
-        assert_eq!(pick_target(0, &readings, &enabled, None, SESS, WK), None);
+        assert_eq!(
+            pick_target(0, &readings, &enabled, None, SESS, WK, SOONEST),
+            None
+        );
     }
 
     // --- pick_target_ranked: velocity-aware + per-daemon jitter (pure, #612) ----------
@@ -997,6 +1244,7 @@ mod tests {
             SelectionTiebreak {
                 accounts: &runtimes(velocity),
                 seed,
+                policy: SOONEST,
             },
         )
     }
@@ -1041,6 +1289,7 @@ mod tests {
                 SelectionTiebreak {
                     accounts: &runtimes(&velocity),
                     seed: Some(9),
+                    policy: SOONEST,
                 },
             ),
             Some((2, NextSwapReason::SoonestReset { resets_at: 200 })),

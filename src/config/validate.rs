@@ -33,6 +33,19 @@ impl Config {
         // accepting the sliver of overage past the effective `ceiling −
         // WEEKLY_TAIL_MARGIN` line that implies.
         range("weekly_ceiling", t.weekly_ceiling, 50, 100)?;
+        // The weekly tail margin (`0..=5`): `0` is the documented ride-to-100 opt-out (fire
+        // point == ceiling), and 5 is the bound that keeps the configured value strictly below
+        // the session dimension's 6 pp `swap::TAIL_MARGIN` — the invariant `WEEKLY_TAIL_MARGIN`
+        // itself asserts compile-time, extended here to the runtime knob.
+        range("weekly_tail_margin_pct", t.weekly_tail_margin_pct, 0, 5)?;
+        // The target-selection policy is a closed enum, not a range: `TargetPolicy::parse`
+        // knows the two spellings and anything else is a config error naming the key.
+        let target_policy = TargetPolicy::parse(&t.target_policy).ok_or_else(|| {
+            Error::ConfigInvalid(format!(
+                "target_policy = {:?}: expected \"soonest_reset\" or \"fullest_weekly\"",
+                t.target_policy
+            ))
+        })?;
         // Issue #452 (ADR-0017) bounded-blindness preemptive-swap gate. `session_blind_swap_secs`
         // is `T` in seconds: floored at 60 (at least one poll cycle blind) and capped at 86400 — a
         // 24 h ceiling far beyond any real blind window, so setting it there disables the path (the
@@ -245,6 +258,8 @@ impl Config {
             target_max_session_usage,
             session_ceiling: t.session_ceiling as u8,
             weekly_ceiling: t.weekly_ceiling as u8,
+            weekly_tail_margin_pct: t.weekly_tail_margin_pct as u8,
+            target_policy,
             session_blind_swap_secs: t.session_blind_swap_secs as u64,
             session_blind_risk_band: t.session_blind_risk_band as u8,
             session_velocity_horizon_secs: t.session_velocity_horizon_secs as u64,
@@ -716,6 +731,73 @@ mod tests {
             t.weekly_ceiling_strategy.base,
             f64::from(DEFAULT_WEEKLY_CEILING)
         );
+    }
+
+    #[test]
+    fn accepts_the_weekly_tail_margin_bounds() {
+        // `weekly_tail_margin_pct` is `0..=5`: 0 is the documented ride-to-100 opt-in
+        // (fire point == ceiling), 5 is the configured maximum — still strictly below the
+        // session dimension's 6 pp tail.
+        for (fragment, expected) in [
+            ("weekly_tail_margin_pct = 0", 0u8),
+            ("weekly_tail_margin_pct = 1", 1),
+            ("weekly_tail_margin_pct = 5", 5),
+        ] {
+            let t = Config::parse(&with_tunables(fragment)).unwrap().tunables;
+            assert_eq!(t.weekly_tail_margin_pct, expected, "{fragment}");
+        }
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_weekly_tail_margin() {
+        for bad in ["6", "10", "-1", "255"] {
+            let toml = with_tunables(&format!("weekly_tail_margin_pct = {bad}"));
+            assert!(
+                matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))),
+                "weekly_tail_margin_pct = {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn weekly_tail_margin_pct_defaults_to_one() {
+        // The absent-field default IS `swap::WEEKLY_TAIL_MARGIN` (1 pp) expressed in percent —
+        // an unwritten config behaves exactly as the pre-tunable build did.
+        let t = Config::parse(VALID).unwrap().tunables;
+        assert_eq!(t.weekly_tail_margin_pct, DEFAULT_WEEKLY_TAIL_MARGIN_PCT);
+        assert_eq!(DEFAULT_WEEKLY_TAIL_MARGIN_PCT, 1);
+    }
+
+    #[test]
+    fn target_policy_parses_both_variants() {
+        let fullest = Config::parse(&with_tunables("target_policy = \"fullest_weekly\""))
+            .unwrap()
+            .tunables;
+        assert_eq!(fullest.target_policy, TargetPolicy::FullestWeekly);
+        let soonest = Config::parse(&with_tunables("target_policy = \"soonest_reset\""))
+            .unwrap()
+            .tunables;
+        assert_eq!(soonest.target_policy, TargetPolicy::SoonestReset);
+        // Absent → the issue #37 default.
+        assert_eq!(
+            Config::parse(VALID).unwrap().tunables.target_policy,
+            TargetPolicy::SoonestReset
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_target_policy() {
+        let toml = with_tunables("target_policy = \"largest_first\"");
+        match Config::parse(&toml) {
+            Err(Error::ConfigInvalid(message)) => {
+                // The message names the bad value and both accepted spellings, so an operator
+                // sees the fix without opening the docs.
+                assert!(message.contains("largest_first"), "{message}");
+                assert!(message.contains("soonest_reset"), "{message}");
+                assert!(message.contains("fullest_weekly"), "{message}");
+            }
+            other => panic!("target_policy = \"largest_first\" should be ConfigInvalid: {other:?}"),
+        }
     }
 
     #[test]

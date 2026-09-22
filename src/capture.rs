@@ -2332,9 +2332,10 @@ mod tests {
         // token derived from the data rather than from the caller would mean something different
         // on every invocation.
         //
-        // SIX call sites, not the five the issue enumerates: `config_restore` arrived with issue
-        // #1439 after #1442 was written. That is the argument for asserting the cardinality below
-        // rather than trusting a count copied from prose.
+        // SEVEN call sites, not the five the issue enumerates: `config_restore` arrived with
+        // issue #1439 after #1442 was written, and `daemon reload` later still. That is the
+        // argument for asserting the cardinality below rather than trusting a count copied
+        // from prose.
         const SITES: &[(&str, &str, &str, &str)] = &[
             (
                 "src/capture.rs",
@@ -2372,6 +2373,12 @@ mod tests {
                 "Mutating",
                 "remove is the canonical shrink, including a legitimate 1 -> 0",
             ),
+            (
+                "src/cli.rs",
+                "async fn daemon_reload",
+                "AppendOnly",
+                "`daemon reload` exists to pick up tunables; it must never shrink the roster",
+            ),
         ];
         const NOTIFY: &str = "notify_daemon_roster_reload(";
 
@@ -2394,15 +2401,15 @@ mod tests {
             );
         }
 
-        // Cardinality, so the loop above is evidence rather than a sample: a SEVENTH verb reaching
-        // the daemon must land in the enumeration, where its intent is a decision somebody made
-        // rather than whichever token was nearest to copy.
+        // Cardinality, so the loop above is evidence rather than a sample: the NEXT verb
+        // reaching the daemon must land in the enumeration, where its intent is a decision
+        // somebody made rather than whichever token was nearest to copy.
         //
-        // Counted over the WHOLE crate, not over the two files that happen to hold today's six.
-        // `notify_daemon_roster_reload` is `pub(crate)`, so every module can reach it, and a
-        // seventh verb landing in `src/config.rs` or `src/swap.rs` is exactly the case a
-        // two-file count cannot see — it would pass, unchanged, having measured a corpus the new
-        // caller is not in.
+        // Counted over the WHOLE crate, not over the two files that happen to hold today's
+        // call sites. `notify_daemon_roster_reload` is `pub(crate)`, so every module can
+        // reach it, and a new verb landing in `src/config.rs` or `src/swap.rs` is exactly
+        // the case a two-file count cannot see — it would pass, unchanged, having measured
+        // a corpus the new caller is not in.
         let (calls, prose) = crate_notify_mentions(NOTIFY);
         assert_eq!(
             calls,

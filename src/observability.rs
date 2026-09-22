@@ -2533,6 +2533,14 @@ pub(crate) enum Event {
         exe_size: Option<u64>,
         exe_mtime: Option<SystemTime>,
     },
+    /// A `roster-reload` control request hot-applied changed swap tunables onto the running
+    /// daemon (`Daemon::adopt_roster_reload`'s tunables half): `changes` is the space-joined
+    /// `key=old→new` list of exactly the keys that moved — `session_ceiling`,
+    /// `session_ceiling_jitter`, `weekly_ceiling`, `weekly_ceiling_jitter`,
+    /// `target_max_session_usage`, `weekly_tail_margin_pct`, `target_policy` — so a reload that
+    /// changed nothing emits NO event at all. Values are percents, counts, jitter specs and the
+    /// policy discriminant — no credential, token, handle or path (issue #15).
+    TunablesReload { changes: String },
 }
 
 impl Event {
@@ -3372,6 +3380,12 @@ impl Event {
                     env!("CARGO_PKG_VERSION")
                 )
             }
+            Event::TunablesReload { changes } => {
+                // `changes` is already the rendered `key=old→new` list (built where the diff is
+                // computed); the values are percents / counts / enum spellings — nothing that
+                // can smuggle a second `event=` token, and `single_line` below guarantees it.
+                format!("ts={ts} event=tunables_reload {changes}")
+            }
         };
         single_line(line)
     }
@@ -3899,6 +3913,8 @@ pub(crate) enum Diagnostic {
         target_max_session_usage: u8,
         session_ceiling: u8,
         weekly_ceiling: u8,
+        weekly_tail_margin_pct: u8,
+        target_policy: &'static str,
         monitor_401_n: u8,
         monitor_recovery_m: u8,
     },
@@ -3981,6 +3997,8 @@ impl Diagnostic {
                 target_max_session_usage,
                 session_ceiling,
                 weekly_ceiling,
+                weekly_tail_margin_pct,
+                target_policy,
                 monitor_401_n,
                 monitor_recovery_m,
             } => {
@@ -3989,7 +4007,8 @@ impl Diagnostic {
                 format!(
                     "ts={ts} diag=start accounts={accounts} poll_secs={poll_secs} \
                      target_max_session_usage={target_max_session_usage} session_ceiling={session_ceiling} \
-                     weekly_ceiling={weekly_ceiling} monitor_401_n={monitor_401_n} \
+                     weekly_ceiling={weekly_ceiling} weekly_tail_margin_pct={weekly_tail_margin_pct} \
+                     target_policy={target_policy} monitor_401_n={monitor_401_n} \
                      monitor_recovery_m={monitor_recovery_m}"
                 )
             }
@@ -6675,6 +6694,7 @@ pub(crate) mod tests {
             Event::ObservationGapExit { .. } => "ObservationGapExit",
             Event::RosterReload { .. } => "RosterReload",
             Event::DaemonBuild { .. } => "DaemonBuild",
+            Event::TunablesReload { .. } => "TunablesReload",
         }
     }
 
@@ -7083,6 +7103,12 @@ pub(crate) mod tests {
                 )),
                 exe_size: Some(4_812_336),
                 exe_mtime: None,
+            },
+            // The hot-applied tunables diff: percents / counts / the policy discriminant joined
+            // as `key=old→new` — no handle, token, or path can ride it.
+            Event::TunablesReload {
+                changes: "weekly_tail_margin_pct=1→0 target_policy=soonest_reset→fullest_weekly"
+                    .to_owned(),
             },
         ];
         assert_samples_every_variant("Event", &samples, event_variant_name);
@@ -9945,6 +9971,8 @@ outcome=failed\n",
             target_max_session_usage: 70,
             session_ceiling: 90,
             weekly_ceiling: 98,
+            weekly_tail_margin_pct: 1,
+            target_policy: "soonest_reset",
             monitor_401_n: 5,
             monitor_recovery_m: 4,
         }
@@ -9953,7 +9981,8 @@ outcome=failed\n",
             line,
             format!(
                 "{TS0} diag=start accounts=3 poll_secs=30 target_max_session_usage=70 \
-                 session_ceiling=90 weekly_ceiling=98 monitor_401_n=5 monitor_recovery_m=4"
+                 session_ceiling=90 weekly_ceiling=98 weekly_tail_margin_pct=1 \
+                 target_policy=soonest_reset monitor_401_n=5 monitor_recovery_m=4"
             )
         );
     }
@@ -10092,6 +10121,8 @@ outcome=failed\n",
                 target_max_session_usage: 70,
                 session_ceiling: 90,
                 weekly_ceiling: 98,
+                weekly_tail_margin_pct: 1,
+                target_policy: "soonest_reset",
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
             },

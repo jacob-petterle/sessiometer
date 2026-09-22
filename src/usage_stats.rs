@@ -2642,7 +2642,7 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
     /// The shipping-default viability boundary: session 0.80 (the #398 reserve binding below the
     /// #597 ceiling 0.95), weekly 0.97 (the #607 effective ceiling below the raw 0.98).
     fn boundary() -> ViabilityBoundary {
-        crate::swap::viability_boundary(0.95, 0.80, 0.98)
+        crate::swap::viability_boundary(0.95, 0.80, 0.98, crate::swap::WEEKLY_TAIL_MARGIN)
     }
 
     /// [`params`] with the capacity-holds census enabled at the default boundary.
@@ -3570,8 +3570,10 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         // rise WITHIN one session window rather than the start of a fresh one. A single such climb
         // refutes "cannot climb"; magnitude is colour, so nothing here pins one.
         let tunables = crate::config::Tunables::default();
-        let rotation_line =
-            crate::swap::weekly_effective_ceiling(f64::from(tunables.weekly_ceiling) / 100.0);
+        let rotation_line = crate::swap::weekly_effective_ceiling(
+            f64::from(tunables.weekly_ceiling) / 100.0,
+            f64::from(tunables.weekly_tail_margin_pct) / 100.0,
+        );
         let widened = tunables.exhausted_poll_secs as i64;
         let mut pinned_pairs = 0_u32;
         // The same count restricted to the never-high population — the class the refutation is

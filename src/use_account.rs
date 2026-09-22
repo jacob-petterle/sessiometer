@@ -705,8 +705,10 @@ where
     // operator command that silently undoes itself. Gating on the same line the daemon rotates
     // against keeps the standalone `use` verdict and the daemon's verdict identical (the daemon-
     // attached path gets the same value from `Daemon::weekly_rotation_line`).
-    let weekly_ceiling =
-        crate::swap::weekly_effective_ceiling(f64::from(config.tunables.weekly_ceiling) / 100.0);
+    let weekly_ceiling = crate::swap::weekly_effective_ceiling(
+        f64::from(config.tunables.weekly_ceiling) / 100.0,
+        f64::from(config.tunables.weekly_tail_margin_pct) / 100.0,
+    );
 
     // 3. Decide the swap MODE and perform the keychain rotation, yielding
     //    `(from_label, reason, adopted)` for the shared event / notify / print tail:
@@ -1091,6 +1093,7 @@ pub(crate) async fn use_account(query: Option<String>, force: bool, next: bool) 
 fn note_next_target(label: &str, reason: Option<NextSwapReason>) -> String {
     let why = match reason {
         Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
+        Some(NextSwapReason::FullestWeekly { .. }) => " (fullest weekly)",
         Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
         Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
         None => "",

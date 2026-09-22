@@ -59,6 +59,7 @@ mod test_support;
 mod validate;
 mod write_lock;
 
+pub(crate) use render::render_jitter;
 pub(crate) use validate::account_uuid_violation;
 
 /// Take the config-write lock for `config_path`, for tests OUTSIDE this module that need to
@@ -163,6 +164,9 @@ const DEFAULT_TARGET_MAX_SESSION_USAGE: u8 = 80;
 /// 98 leaves the weekly fire point at 97, still well above the session ceiling, preserving the
 /// "weekly is the harder limit, allowed closer to full" intent this default has always encoded.
 const DEFAULT_WEEKLY_CEILING: u8 = 98;
+/// Default `weekly_tail_margin_pct` — [`crate::swap::WEEKLY_TAIL_MARGIN`] expressed in percent
+/// (1 pp), so an absent key keeps the #607-derived landing headroom the constant encodes.
+const DEFAULT_WEEKLY_TAIL_MARGIN_PCT: u8 = 1;
 /// Default consecutive-401 count before an account is treated as rejected.
 const DEFAULT_MONITOR_401_N: u8 = 3;
 /// Default consecutive recovery-probe successes before a quarantined (dead)
@@ -481,13 +485,25 @@ pub(crate) struct Tunables {
     /// post-swap committed tail: the same in-flight work that keeps billing the parked account's
     /// session window bills its weekly window too (issue #595 measured the tail on the session axis;
     /// #596 confirmed it is real in-flight drain and saw weekly co-move in 8/13 episodes). The
-    /// margin is 1 pp — NOT the session dimension's 6 pp — because the same committed tail is a far
-    /// smaller fraction of the weekly BUDGET than of a session window (worst-case `5 pp / k` for the
-    /// quota ratio `k = weekly_quota / session_quota`, covered by 1 pp under the stated `k ≥ 5`
-    /// assumption — NOT the window-duration ratio, which would justify the margin in the wrong
-    /// direction; see `swap::WEEKLY_TAIL_MARGIN` for the full provenance). The two dimensions carry
-    /// independently calibrated margins by design.
+    /// margin is `weekly_tail_margin_pct` (default 1 pp) — NOT the session dimension's 6 pp —
+    /// because the same committed tail is a far smaller fraction of the weekly BUDGET than of a
+    /// session window (worst-case `5 pp / k` for the quota ratio
+    /// `k = weekly_quota / session_quota`, covered by 1 pp under the stated `k ≥ 5` assumption —
+    /// NOT the window-duration ratio, which would justify the margin in the wrong direction; see
+    /// `swap::WEEKLY_TAIL_MARGIN` for the full provenance). The two dimensions carry independently
+    /// calibrated margins by design.
     pub(crate) weekly_ceiling: u8,
+    /// The weekly TAIL MARGIN (`0..=5` percent; default 1 — `swap::WEEKLY_TAIL_MARGIN`): the
+    /// headroom the swap decision subtracts from `weekly_ceiling`, so the fire point is
+    /// `weekly_ceiling − weekly_tail_margin_pct` and the outgoing account lands below the
+    /// ceiling after its post-swap committed tail. `0` is the deliberate opt-out: the fire
+    /// point degenerates to a fire-AT trigger at the raw ceiling (the swap then fires only
+    /// once the weekly reading reaches it — at ceiling 100, after Claude itself blocks the
+    /// running turn), letting an account ride its weekly window to the full 100%.
+    pub(crate) weekly_tail_margin_pct: u8,
+    /// The swap-TARGET selection policy (`"soonest_reset"` | `"fullest_weekly"`, default
+    /// `"soonest_reset"`): which viable account the daemon promotes. See [`TargetPolicy`].
+    pub(crate) target_policy: TargetPolicy,
     /// Bounded-blindness preemptive-swap gate threshold `T` (issue #452, ADR-0017), in
     /// seconds: the active account's retained pre-blind anchor (`last_good`, #450) must
     /// be stale beyond this before the gate arms. Promoted from the interim
@@ -633,6 +649,42 @@ pub(crate) struct Tunables {
     pub(crate) cooldown_strategy: Strategy,
 }
 
+/// The swap-TARGET selection policy (`[tunables] target_policy`): which account the daemon
+/// promotes AMONG the viable set — the viability filter itself is identical under both.
+///
+/// `SoonestReset` (the default) keeps the issue #37 axis: the account whose weekly window
+/// resets soonest wins, so the daemon spends an allowance that is about to refill anyway.
+/// `FullestWeekly` ranks by weekly usage DESCENDING — spend the fullest account's remaining
+/// sliver first — with the #37 chain (known-reset-first → soonest reset → velocity → per-daemon
+/// jitter → roster index) demoted to the tiebreak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetPolicy {
+    /// `"soonest_reset"` — the issue #37 soonest-weekly-reset axis.
+    SoonestReset,
+    /// `"fullest_weekly"` — weekly usage descending, #37 chain as tiebreak.
+    FullestWeekly,
+}
+
+impl TargetPolicy {
+    /// The wire / config spelling of this policy.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SoonestReset => "soonest_reset",
+            Self::FullestWeekly => "fullest_weekly",
+        }
+    }
+
+    /// Parse a `[tunables] target_policy` value; `None` on an unknown string so the caller
+    /// ([`Config::validate`]) can name the key in its rejection.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "soonest_reset" => Some(Self::SoonestReset),
+            "fullest_weekly" => Some(Self::FullestWeekly),
+            _ => None,
+        }
+    }
+}
+
 impl Default for Tunables {
     fn default() -> Self {
         Self {
@@ -643,6 +695,8 @@ impl Default for Tunables {
             target_max_session_usage: DEFAULT_TARGET_MAX_SESSION_USAGE,
             session_ceiling: DEFAULT_SESSION_CEILING,
             weekly_ceiling: DEFAULT_WEEKLY_CEILING,
+            weekly_tail_margin_pct: DEFAULT_WEEKLY_TAIL_MARGIN_PCT,
+            target_policy: TargetPolicy::SoonestReset,
             session_blind_swap_secs: DEFAULT_SESSION_BLIND_SWAP_SECS,
             session_blind_risk_band: DEFAULT_SESSION_BLIND_RISK_BAND,
             session_velocity_horizon_secs: DEFAULT_SESSION_VELOCITY_HORIZON_SECS,
@@ -1469,6 +1523,14 @@ struct RawTunables {
     session_ceiling: i64,
     #[serde(default = "default_weekly_ceiling")]
     weekly_ceiling: i64,
+    // An absent key resolves to the `swap::WEEKLY_TAIL_MARGIN` default (1 pp) — the
+    // calibrated value; `0` is the operator's deliberate ride-to-100 opt-out.
+    #[serde(default = "default_weekly_tail_margin_pct")]
+    weekly_tail_margin_pct: i64,
+    // An absent key resolves to `"soonest_reset"`, the issue #37 policy the codebase
+    // has always run — the unchanged-behaviour default.
+    #[serde(default = "default_target_policy")]
+    target_policy: String,
     #[serde(default = "default_session_blind_swap_secs")]
     session_blind_swap_secs: i64,
     #[serde(default = "default_session_blind_risk_band")]
@@ -1525,6 +1587,8 @@ impl Default for RawTunables {
             target_max_session_usage: None,
             session_ceiling: default_session_ceiling(),
             weekly_ceiling: default_weekly_ceiling(),
+            weekly_tail_margin_pct: default_weekly_tail_margin_pct(),
+            target_policy: default_target_policy(),
             session_blind_swap_secs: default_session_blind_swap_secs(),
             session_blind_risk_band: default_session_blind_risk_band(),
             session_velocity_horizon_secs: default_session_velocity_horizon_secs(),
@@ -1559,6 +1623,12 @@ fn default_session_ceiling() -> i64 {
 }
 fn default_weekly_ceiling() -> i64 {
     i64::from(DEFAULT_WEEKLY_CEILING)
+}
+fn default_weekly_tail_margin_pct() -> i64 {
+    i64::from(DEFAULT_WEEKLY_TAIL_MARGIN_PCT)
+}
+fn default_target_policy() -> String {
+    TargetPolicy::SoonestReset.as_str().to_owned()
 }
 fn default_session_blind_swap_secs() -> i64 {
     DEFAULT_SESSION_BLIND_SWAP_SECS as i64

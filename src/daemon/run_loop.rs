@@ -716,6 +716,11 @@ where
             Idle::RosterReloadRequested(intent) => {
                 let event = daemon.adopt_roster_reload(intent).await;
                 emit_best_effort(log, &event);
+                // Hot-applied swap tunables queue a `tunables_reload` event inside
+                // the adoption; drain it onto the same channel in the same call turn.
+                for pending in daemon.take_pending_events() {
+                    emit_best_effort(log, &pending);
+                }
             }
             // Reconcile the revived account the `restored` control command named (#275 +
             // issue #643): a bare `Degraded` quarantine takes the plain on-demand

@@ -242,10 +242,16 @@ const _: () = assert!(WEEKLY_TAIL_MARGIN < TAIL_MARGIN);
 /// margin, because the two dimensions are independent by design (issue #41): each carries its own
 /// measured margin, and a single knob would invite the copy this constant's provenance rejects.
 ///
+/// The margin is the RUNTIME `margin` parameter, not the [`WEEKLY_TAIL_MARGIN`] constant: the
+/// constant is the compiled-in DEFAULT (`[tunables] weekly_tail_margin_pct`, `0..=5`), and the
+/// daemon carries the configured value so a reload can move it. `margin = 0` is valid and
+/// degenerates the arm to a fire-AT trigger (fire point == ceiling, landing above it) — the
+/// documented opt-in for riding a weekly window to 100%.
+///
 /// Clamped at 0 so a pathologically low `ceiling` can never yield a negative fire point. `ceiling`
-/// is a fraction in `[0.0, 1.0]` (`weekly_ceiling` / 100).
-pub(crate) fn weekly_effective_ceiling(ceiling: f64) -> f64 {
-    (ceiling - WEEKLY_TAIL_MARGIN).max(0.0)
+/// is a fraction in `[0.0, 1.0]` (`weekly_ceiling` / 100); `margin` likewise (`pct` / 100).
+pub(crate) fn weekly_effective_ceiling(ceiling: f64, margin: f64) -> f64 {
+    (ceiling - margin).max(0.0)
 }
 
 /// The daemon's VIABILITY BOUNDARY: the pair of utilisation lines at/above which an account can
@@ -271,7 +277,7 @@ pub(crate) struct ViabilityBoundary {
     /// The SESSION line: `min(session_ceiling, target_max_session_usage)` — 0.80 at defaults,
     /// where the #398 default-on target reserve (80) binds below the #597 ceiling (95).
     pub(crate) session: f64,
-    /// The WEEKLY line: [`weekly_effective_ceiling`]`(weekly_ceiling)` — 0.97 at defaults, NOT the
+    /// The WEEKLY line: [`weekly_effective_ceiling`]`(weekly_ceiling, margin)` — 0.97 at defaults, NOT the
     /// raw 0.98. The [`WEEKLY_TAIL_MARGIN`] pp is load-bearing here and not a rounding detail: an
     /// account resting at exactly 0.97 is blocked FOR THE DAEMON while a predicate written against
     /// the raw ceiling sees it as viable, so an aggregate that took the raw value would undercount
@@ -284,14 +290,18 @@ pub(crate) struct ViabilityBoundary {
 /// Both arms are derived exactly as [`crate::daemon`]'s own target filter derives them, and the
 /// weekly arm routes through [`weekly_effective_ceiling`] — the same function the daemon's release
 /// and acquire predicates call — so the three surfaces share one origin and cannot drift apart.
+/// `weekly_tail_margin` is the CONFIGURED weekly tail margin as a fraction (`[tunables]
+/// weekly_tail_margin_pct` / 100) — the same value the daemon's own predicates run with, so
+/// this boundary cannot drift from them on a non-default margin.
 pub(crate) fn viability_boundary(
     session_ceiling: f64,
     target_max_session_usage: f64,
     weekly_ceiling: f64,
+    weekly_tail_margin: f64,
 ) -> ViabilityBoundary {
     ViabilityBoundary {
         session: session_ceiling.min(target_max_session_usage),
-        weekly: weekly_effective_ceiling(weekly_ceiling),
+        weekly: weekly_effective_ceiling(weekly_ceiling, weekly_tail_margin),
     }
 }
 
@@ -1200,11 +1210,55 @@ mod tests {
         // The default weekly ceiling 0.98 yields an effective ceiling of 0.97 — the 1 pp weekly
         // tail margin below the settled weekly line, so a landing here plus the worst-case weekly
         // committed tail (`5 pp / k`, ≤ 1 pp under the `k ≥ 5` assumption) stays under 0.98.
-        assert!((weekly_effective_ceiling(0.98) - 0.97).abs() < 1e-9);
-        assert!((weekly_effective_ceiling(0.95) - 0.94).abs() < 1e-9);
+        assert!((weekly_effective_ceiling(0.98, WEEKLY_TAIL_MARGIN) - 0.97).abs() < 1e-9);
+        assert!((weekly_effective_ceiling(0.95, WEEKLY_TAIL_MARGIN) - 0.94).abs() < 1e-9);
         // Clamped at 0 for a pathologically low ceiling — never negative.
-        assert_eq!(weekly_effective_ceiling(0.005), 0.0);
-        assert_eq!(weekly_effective_ceiling(0.0), 0.0);
+        assert_eq!(weekly_effective_ceiling(0.005, WEEKLY_TAIL_MARGIN), 0.0);
+        assert_eq!(weekly_effective_ceiling(0.0, WEEKLY_TAIL_MARGIN), 0.0);
+    }
+
+    #[test]
+    fn weekly_effective_ceiling_reaches_the_ceiling_at_a_zero_margin() {
+        // `weekly_tail_margin_pct = 0` — the documented opt-in for riding a weekly window to
+        // 100%: the effective line IS the ceiling. At ceiling 1.00 the line is 1.00, so a 0.99
+        // reading still fits under it and a 1.00 reading lands on it (inclusive `>=`).
+        assert_eq!(weekly_effective_ceiling(1.0, 0.0), 1.0);
+        // The shipping default (1 pp) keeps the line at 0.99 at the same ceiling.
+        assert!((weekly_effective_ceiling(1.0, WEEKLY_TAIL_MARGIN) - 0.99).abs() < 1e-9);
+        // And the configured maximum (5 pp) still fires strictly early.
+        assert!((weekly_effective_ceiling(1.0, 0.05) - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decide_weekly_arm_fires_at_the_line_under_a_zero_margin() {
+        // Ceiling 1.00 + margin 0 → threshold 1.00: the weekly arm of `decide` holds a 0.99
+        // reading and fires on a 1.00 one (`>=`, like the session arm's raw-ceiling case).
+        let line = weekly_effective_ceiling(1.0, 0.0);
+        let at_99 = Usage {
+            session: 0.0,
+            weekly: 0.99,
+            weekly_all: 0.99,
+            weekly_scoped: None,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+        let at_100 = Usage {
+            weekly: 1.0,
+            weekly_all: 1.0,
+            ..at_99
+        };
+        assert_eq!(decide(&at_99, f64::MAX, line), SwapDecision::Hold);
+        assert_eq!(decide(&at_100, f64::MAX, line), SwapDecision::Swap);
+    }
+
+    #[test]
+    fn viability_boundary_reaches_100_at_a_zero_margin() {
+        // The viability half of the margin-0 pairing: boundary(…, weekly_ceiling 1.0, margin 0)
+        // carries `weekly` == 1.0 — a 0.99 reading is not blocked, a 1.00 reading is.
+        let boundary = viability_boundary(0.95, 0.80, 1.0, 0.0);
+        assert_eq!(boundary.weekly, 1.0);
+        assert!(!boundary.weekly_blocked(0.99));
+        assert!(boundary.weekly_blocked(1.0));
     }
 
     #[test]
@@ -1222,7 +1276,7 @@ mod tests {
         // independent corroboration. Only a weekly landing SLI can settle the magnitude.
         for ceiling_pct in 50..=100u8 {
             let ceiling = f64::from(ceiling_pct) / 100.0;
-            let fire = weekly_effective_ceiling(ceiling);
+            let fire = weekly_effective_ceiling(ceiling, WEEKLY_TAIL_MARGIN);
             assert!(
                 fire < ceiling,
                 "weekly ceiling {ceiling_pct}: fire point {fire} must be strictly below the ceiling",
@@ -1244,14 +1298,16 @@ mod tests {
         // ceiling. The weekly 0.97 is the load-bearing digit — a census written against the raw
         // 0.98 would see an account resting at exactly 0.97 as viable while the daemon,
         // enforcing this line, could not swap to it.
-        let b = viability_boundary(0.95, 0.80, 0.98);
+        let b = viability_boundary(0.95, 0.80, 0.98, WEEKLY_TAIL_MARGIN);
         assert!((b.session - 0.80).abs() < 1e-9);
         assert!((b.weekly - 0.97).abs() < 1e-9);
         assert!(b.weekly < 0.98, "the weekly line is NOT the raw ceiling");
 
         // The session arm takes whichever line binds — a reserve raised above the ceiling cannot
         // loosen the boundary past the ceiling itself.
-        assert!((viability_boundary(0.90, 0.95, 0.98).session - 0.90).abs() < 1e-9);
+        assert!(
+            (viability_boundary(0.90, 0.95, 0.98, WEEKLY_TAIL_MARGIN).session - 0.90).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -1259,7 +1315,7 @@ mod tests {
         // At the weekly bound's 100 end the effective viability line is 0.99:
         // an account resting at 98% weekly is a viable target, and the last
         // margin point lands the outgoing account just under the raw ceiling.
-        let b = viability_boundary(0.99, 0.80, 1.0);
+        let b = viability_boundary(0.99, 0.80, 1.0, WEEKLY_TAIL_MARGIN);
         assert!((b.weekly - 0.99).abs() < 1e-9);
     }
 
@@ -1272,8 +1328,8 @@ mod tests {
         for ceiling_pct in 50..=100u8 {
             let ceiling = f64::from(ceiling_pct) / 100.0;
             assert_eq!(
-                viability_boundary(0.95, 0.80, ceiling).weekly,
-                weekly_effective_ceiling(ceiling),
+                viability_boundary(0.95, 0.80, ceiling, WEEKLY_TAIL_MARGIN).weekly,
+                weekly_effective_ceiling(ceiling, WEEKLY_TAIL_MARGIN),
                 "weekly ceiling {ceiling_pct}: boundary must not re-derive the weekly line",
             );
         }
@@ -1281,7 +1337,7 @@ mod tests {
 
     #[test]
     fn viability_boundary_blocks_at_the_line_inclusively_and_per_dimension() {
-        let b = viability_boundary(0.95, 0.80, 0.98);
+        let b = viability_boundary(0.95, 0.80, 0.98, WEEKLY_TAIL_MARGIN);
         // AT the line already blocks — a ceiling is a not-cross line, matching the daemon's `>=`.
         assert!(b.session_blocked(0.80));
         assert!(b.weekly_blocked(0.97));

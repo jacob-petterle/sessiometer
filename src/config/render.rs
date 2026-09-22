@@ -886,8 +886,7 @@ impl Config {
 /// Render a [`Jitter`] as the inline TOML table [`RawJitterSpec`] parses back
 /// (issue #38). Magnitudes use the float-debug form so they always carry a
 /// decimal point and round-trip as TOML floats (never as integers).
-#[allow(dead_code)]
-fn render_jitter(jitter: &Jitter) -> String {
+pub(crate) fn render_jitter(jitter: &Jitter) -> String {
     match jitter {
         Jitter::None => "{ kind = \"none\" }".to_string(),
         Jitter::Uniform { spread } => format!("{{ kind = \"uniform\", spread = {spread:?} }}"),

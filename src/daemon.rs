@@ -96,7 +96,7 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 use crate::canary::{self, CanaryOutcome, InconclusiveReason, Liveness, ProbeGate};
 use crate::claude_state;
 use crate::config::{
-    Account, Config, Tunables, DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
+    Account, Config, TargetPolicy, Tunables, DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
     DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS, DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
 };
 // The daemon↔refresh_tick boundary contract (issue #202) lives in its own leaf module so
@@ -1740,6 +1740,17 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// This is the RAW ceiling. Rotation decisions must NOT use it directly — they use
     /// [`Self::weekly_rotation_line`], which applies the tail margin. See that method for why.
     weekly_ceiling_base: f64,
+    /// The configured weekly TAIL MARGIN as a fraction (`weekly_tail_margin_pct / 100`,
+    /// `0..=5`; [`crate::swap::WEEKLY_TAIL_MARGIN`] is only its compiled-in default). Every
+    /// weekly line the daemon derives — [`Self::weekly_rotation_line`], the `decide` fire
+    /// point, the viability boundary — subtracts THIS value from the ceiling, so a reload
+    /// (`adopt_roster_reload`) can move it without a restart. `0` is the documented
+    /// ride-to-100 opt-out: the fire point degenerates to the raw ceiling.
+    weekly_tail_margin: f64,
+    /// The configured swap-TARGET selection policy (`[tunables] target_policy`), carried by
+    /// [`Self::selection_tiebreak`] into every `pick_target*` call so the choice AMONG viable
+    /// accounts follows it; the viability filter is policy-independent.
+    target_policy: crate::config::TargetPolicy,
     /// Base SESSION swap-away threshold as a fraction (`session_ceiling / 100`),
     /// un-jittered — the session-dimension counterpart of [`Self::weekly_ceiling_base`].
     /// The always-on session anti-thrash gate in [`pick_target`] keys off this on the
@@ -2024,6 +2035,12 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// Like it, a REPORTING bound only: nothing on the swap or poll path reads it.
     credential_expiry_cohort_window_secs: u64,
     state: DecisionState,
+    /// Durable events produced OUTSIDE `tick`'s `events` channel — currently the
+    /// `tunables_reload` diff a hot-applied config change queues inside
+    /// `adopt_roster_reload` (whose signature returns exactly ONE roster event). Drained by
+    /// the run loop immediately after the reload arm emits, so the line lands on the same
+    /// durable channel in the same call turn.
+    pending_events: Vec<Event>,
 }
 
 impl<P, C, S, K> Daemon<P, C, S, K>
@@ -2065,6 +2082,8 @@ where
             // `swap::WEEKLY_TAIL_MARGIN` (issue #607/#72) — NOT this raw value directly, and
             // NOT the per-cycle jittered swap-decision draw.
             weekly_ceiling_base: f64::from(tunables.weekly_ceiling) / 100.0,
+            weekly_tail_margin: f64::from(tunables.weekly_tail_margin_pct) / 100.0,
+            target_policy: tunables.target_policy,
             session_ceiling_base: f64::from(tunables.session_ceiling) / 100.0,
             target_max_session_usage: f64::from(tunables.target_max_session_usage) / 100.0,
             session_blind_swap_secs: tunables.session_blind_swap_secs,
@@ -2168,7 +2187,14 @@ where
                 accounts,
                 ..DecisionState::default()
             },
+            pending_events: Vec::new(),
         }
+    }
+
+    /// Take the events queued outside `tick`'s channel (see [`Self::pending_events`]) — the run
+    /// loop drains this right after the reload arm so nothing queued sits past one call turn.
+    pub(crate) fn take_pending_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.pending_events)
     }
 
     /// Wire the single-writer swap lock (issue #64): every swap then acquires the
@@ -2544,6 +2570,7 @@ where
         SelectionTiebreak {
             accounts: &self.state.accounts,
             seed: self.tiebreak_seed,
+            policy: self.target_policy,
         }
     }
 
@@ -3835,6 +3862,10 @@ where
             Some(self.target_max_session_usage),
             self.session_ceiling_base,
             self.weekly_rotation_line(),
+            // Policy-independent here (only membership is asked — `.is_some()` — and both
+            // policies share one viability filter); the configured policy is passed anyway so
+            // this call cannot silently pin the soonest-reset axis.
+            self.target_policy,
         )
         .is_some();
         events.push(Event::BlindGateEligible {
@@ -4108,7 +4139,7 @@ where
     /// and a dead or scrubbed credential is worse than a target that must swap again shortly, so
     /// they keep the raw ceiling and admit the widest viable set.
     fn weekly_rotation_line(&self) -> f64 {
-        swap::weekly_effective_ceiling(self.weekly_ceiling_base)
+        swap::weekly_effective_ceiling(self.weekly_ceiling_base, self.weekly_tail_margin)
     }
 
     /// Decide what to do about the active account this cycle, performing the swap
@@ -4251,6 +4282,7 @@ where
             session_ceiling,
             self.target_max_session_usage,
             weekly_ceiling,
+            self.weekly_tail_margin,
         );
         let weekly_threshold = boundary.weekly;
         if swap::decide(&active_usage, session_threshold, weekly_threshold) == SwapDecision::Hold {
@@ -5518,6 +5550,7 @@ where
                 self.session_ceiling_base,
                 self.target_max_session_usage,
                 self.weekly_ceiling_base,
+                self.weekly_tail_margin,
             );
             let (cause, _hold, resets_at) = all_exhausted_relief(
                 active_idx,
@@ -6928,6 +6961,11 @@ mod tests {
             target_max_session_usage: floor,
             session_ceiling,
             weekly_ceiling: WEEKLY_CEILING,
+            // The shipping defaults: 1 pp weekly tail margin (`swap::WEEKLY_TAIL_MARGIN`) and
+            // the issue #37 soonest-reset selection — so the thousands of tests that pin
+            // today's rotation behaviour are byte-identical under them.
+            weekly_tail_margin_pct: 1,
+            target_policy: crate::config::TargetPolicy::SoonestReset,
             // Issue #452 bounded-blindness preemptive swap: INERT by default (T parked at
             // the kill-switch ceiling) so baseline daemon tests are unperturbed by the new
             // gate; the blind-swap tests override `session_blind_swap_secs` to arm it.
@@ -19080,6 +19118,8 @@ mod tests {
                 target_max_session_usage: 70,
                 session_ceiling: 90,
                 weekly_ceiling: 98,
+                weekly_tail_margin_pct: 1,
+                target_policy: "soonest_reset",
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
             }

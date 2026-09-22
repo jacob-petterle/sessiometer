@@ -828,6 +828,7 @@ fn params_from(config: Option<&Config>) -> AggregateParams {
         f64::from(tunables.session_ceiling) / 100.0,
         f64::from(tunables.target_max_session_usage) / 100.0,
         f64::from(tunables.weekly_ceiling) / 100.0,
+        f64::from(tunables.weekly_tail_margin_pct) / 100.0,
     );
     AggregateParams::new((tunables.poll_secs as i64).max(1), cap, cap).with_viability(viability)
 }
@@ -8468,7 +8469,10 @@ mod tests {
         let now = epoch("2026-07-01T12:00:00Z");
         // The same boundary the daemon slow-polls on and the same one REQ-STA-B-010 requires a
         // representativeness predicate to reuse — read from the shared helper, never a literal.
-        let near_ceiling = crate::swap::weekly_effective_ceiling(vparams().weekly_ceiling);
+        let near_ceiling = crate::swap::weekly_effective_ceiling(
+            vparams().weekly_ceiling,
+            crate::swap::WEEKLY_TAIL_MARGIN,
+        );
         let hot = [
             ("hot-a", 0.960),
             ("hot-b", 0.965),

@@ -950,6 +950,12 @@ pub(crate) enum NextSwapReason {
     /// were viable here, so a renderer must never claim this one was the only one — that would be
     /// the very false-rationale bug #393 exists to remove. Carries no epoch because none exists.
     RosterOrder,
+    /// The `target_policy = "fullest_weekly"` axis won: of ≥2 viable accounts the winner holds the
+    /// HIGHEST weekly reading — the spend-the-sliver-first policy, with the #37 reset chain as its
+    /// tiebreak. `weekly_pct` is the winner's weekly percent (the dominant key it won on). A
+    /// weekly tie decided by the demoted reset chain still reports this variant — the winner IS
+    /// among the fullest either way, and the axis that nominated it is the truthful one.
+    FullestWeekly { weekly_pct: u8 },
 }
 
 /// WHY [`NextSwap::NoViableTarget`] has no target — the fleet-capacity RELIEF cause (issue #405),

@@ -7664,7 +7664,8 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
         // ceiling itself may now be set AT 100 — the margin still holds the fire point below it).
         for ceiling_pct in 50..=100u8 {
             let ceiling = f64::from(ceiling_pct) / 100.0;
-            let fire = crate::swap::weekly_effective_ceiling(ceiling);
+            let fire =
+                crate::swap::weekly_effective_ceiling(ceiling, crate::swap::WEEKLY_TAIL_MARGIN);
             assert!(
                 fire < ceiling,
                 "weekly ceiling {ceiling_pct}: fire below ceiling"
