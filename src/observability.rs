@@ -3915,6 +3915,7 @@ pub(crate) enum Diagnostic {
         weekly_ceiling: u8,
         weekly_tail_margin_pct: u8,
         target_policy: &'static str,
+        weekly_scoped_binding: bool,
         monitor_401_n: u8,
         monitor_recovery_m: u8,
     },
@@ -3999,6 +4000,7 @@ impl Diagnostic {
                 weekly_ceiling,
                 weekly_tail_margin_pct,
                 target_policy,
+                weekly_scoped_binding,
                 monitor_401_n,
                 monitor_recovery_m,
             } => {
@@ -4008,7 +4010,8 @@ impl Diagnostic {
                     "ts={ts} diag=start accounts={accounts} poll_secs={poll_secs} \
                      target_max_session_usage={target_max_session_usage} session_ceiling={session_ceiling} \
                      weekly_ceiling={weekly_ceiling} weekly_tail_margin_pct={weekly_tail_margin_pct} \
-                     target_policy={target_policy} monitor_401_n={monitor_401_n} \
+                     target_policy={target_policy} weekly_scoped_binding={weekly_scoped_binding} \
+                     monitor_401_n={monitor_401_n} \
                      monitor_recovery_m={monitor_recovery_m}"
                 )
             }
@@ -9973,6 +9976,7 @@ outcome=failed\n",
             weekly_ceiling: 98,
             weekly_tail_margin_pct: 1,
             target_policy: "soonest_reset",
+            weekly_scoped_binding: true,
             monitor_401_n: 5,
             monitor_recovery_m: 4,
         }
@@ -9982,7 +9986,7 @@ outcome=failed\n",
             format!(
                 "{TS0} diag=start accounts=3 poll_secs=30 target_max_session_usage=70 \
                  session_ceiling=90 weekly_ceiling=98 weekly_tail_margin_pct=1 \
-                 target_policy=soonest_reset monitor_401_n=5 monitor_recovery_m=4"
+                 target_policy=soonest_reset weekly_scoped_binding=true monitor_401_n=5 monitor_recovery_m=4"
             )
         );
     }
@@ -10123,6 +10127,7 @@ outcome=failed\n",
                 weekly_ceiling: 98,
                 weekly_tail_margin_pct: 1,
                 target_policy: "soonest_reset",
+                weekly_scoped_binding: true,
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
             },

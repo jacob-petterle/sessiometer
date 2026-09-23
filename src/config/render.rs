@@ -83,6 +83,21 @@ impl Config {
                     present("tunables", "weekly_ceiling"),
                 ),
                 entry(
+                    "weekly_tail_margin_pct",
+                    t.weekly_tail_margin_pct.to_string(),
+                    present("tunables", "weekly_tail_margin_pct"),
+                ),
+                entry(
+                    "target_policy",
+                    basic_string(t.target_policy.as_str()),
+                    present("tunables", "target_policy"),
+                ),
+                entry(
+                    "weekly_scoped_binding",
+                    t.weekly_scoped_binding.to_string(),
+                    present("tunables", "weekly_scoped_binding"),
+                ),
+                entry(
                     "session_blind_swap_secs",
                     t.session_blind_swap_secs.to_string(),
                     present("tunables", "session_blind_swap_secs"),
@@ -501,6 +516,40 @@ impl Config {
              # far smaller fraction of a 7-day window. See ADR-0025 (docs/adr).\n",
         );
         out.push_str(&format!("weekly_ceiling = {}\n", t.weekly_ceiling));
+        out.push_str(
+            "# The weekly TAIL MARGIN in percent (0..=5, default 1): the headroom the swap\n\
+             # decision subtracts from weekly_ceiling, so the fire point is\n\
+             # weekly_ceiling - weekly_tail_margin_pct and the outgoing account lands below\n\
+             # the ceiling after its post-swap committed tail. 0 is the deliberate opt-out:\n\
+             # the swap then fires only once the weekly reading reaches the raw ceiling (at\n\
+             # ceiling 100, after Claude itself blocks the running turn).\n",
+        );
+        out.push_str(&format!(
+            "weekly_tail_margin_pct = {}\n",
+            t.weekly_tail_margin_pct
+        ));
+        out.push_str(
+            "# The swap-TARGET selection policy: \"soonest_reset\" (default) promotes the\n\
+             # viable account whose weekly window resets soonest; \"fullest_weekly\" promotes\n\
+             # the viable account with the HIGHEST weekly reading, riding the fullest window\n\
+             # first and letting the rested ones rest.\n",
+        );
+        out.push_str(&format!(
+            "target_policy = {}\n",
+            basic_string(t.target_policy.as_str())
+        ));
+        out.push_str(
+            "# Whether a per-model weekly_scoped cap (e.g. Fable) may be the binding weekly\n\
+             # reading. true (default): the highest scoped cap outvotes the all-models window\n\
+             # when higher, so an account whose Fable cap is exhausted is weekly-exhausted.\n\
+             # false: only the all-models weekly window binds — scoped caps are still recorded\n\
+             # in samples but never park an account or fire a swap. Set false when the models\n\
+             # you run bill only the all-models window.\n",
+        );
+        out.push_str(&format!(
+            "weekly_scoped_binding = {}\n",
+            t.weekly_scoped_binding
+        ));
         out.push_str(
             "# Bounded-blindness preemptive swap (issue #452, ADR-0017): when the active\n\
              # account's usage poll stays blind (429/5xx) longer than this many seconds AND\n\
@@ -1198,6 +1247,9 @@ mod tests {
             "target_max_session_usage",
             "session_ceiling",
             "weekly_ceiling",
+            "weekly_tail_margin_pct",
+            "target_policy",
+            "weekly_scoped_binding",
             "session_velocity_horizon_secs",
             "session_velocity_min_project_above",
             "session_velocity_ema_alpha_pct",

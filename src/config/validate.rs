@@ -260,6 +260,7 @@ impl Config {
             weekly_ceiling: t.weekly_ceiling as u8,
             weekly_tail_margin_pct: t.weekly_tail_margin_pct as u8,
             target_policy,
+            weekly_scoped_binding: t.weekly_scoped_binding,
             session_blind_swap_secs: t.session_blind_swap_secs as u64,
             session_blind_risk_band: t.session_blind_risk_band as u8,
             session_velocity_horizon_secs: t.session_velocity_horizon_secs as u64,
@@ -798,6 +799,20 @@ mod tests {
             }
             other => panic!("target_policy = \"largest_first\" should be ConfigInvalid: {other:?}"),
         }
+    }
+
+    #[test]
+    fn weekly_scoped_binding_defaults_to_true() {
+        let t = Config::parse(VALID).unwrap().tunables;
+        assert!(t.weekly_scoped_binding);
+    }
+
+    #[test]
+    fn weekly_scoped_binding_parses_false() {
+        let t = Config::parse(&with_tunables("weekly_scoped_binding = false"))
+            .unwrap()
+            .tunables;
+        assert!(!t.weekly_scoped_binding);
     }
 
     #[test]

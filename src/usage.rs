@@ -149,12 +149,32 @@ pub(crate) struct PolledReading {
     /// scoped cap overrides) so a consumer can chart the per-model reset even
     /// when the all-models window is the binding one.
     pub(crate) weekly_scoped_resets_at: Option<i64>,
+    /// Epoch seconds at which the ALL-MODELS weekly window resets — the
+    /// `seven_day` `resets_at` BEFORE the scoped override [`Usage::weekly`]
+    /// describes. Kept here (not on [`Usage`]) so
+    /// [`PolledReading::with_weekly_scoped_binding`] can restore the all-models
+    /// reset when the scoped override is switched off.
+    pub(crate) weekly_all_resets_at: Option<i64>,
     /// The account's paid-extra-usage posture, when the response reported one —
     /// top-level `extra_usage`, falling back to the `spend` object when the API
     /// omits the former. Persisted to the sample store and `status --json`; the
     /// swap-decision path does not consume it. Non-secret throughout (amounts
     /// and flags only — never identifiers).
     pub(crate) extra_usage: Option<ExtraUsage>,
+}
+
+impl PolledReading {
+    /// Apply `[tunables] weekly_scoped_binding`: when `false`, the all-models
+    /// window is the binding weekly reading — `weekly` and `weekly_resets_at`
+    /// revert to the pre-override `seven_day` values; the scoped breakdown
+    /// (`weekly_scoped*`) is untouched so samples keep the split.
+    pub(crate) fn with_weekly_scoped_binding(mut self, binding: bool) -> Self {
+        if !binding {
+            self.usage.weekly = self.usage.weekly_all;
+            self.usage.weekly_resets_at = self.weekly_all_resets_at;
+        }
+        self
+    }
 }
 
 /// The provider's paid-extra-usage posture for an account (the response's
@@ -204,6 +224,12 @@ struct UsageReport {
     /// The winning scoped entry's raw `resets_at` (see `weekly_resets_at`),
     /// regardless of whether the scoped cap outvoted the all-models window.
     weekly_scoped_resets_at: Option<String>,
+    /// The raw `seven_day` `resets_at` captured BEFORE the scoped override —
+    /// what `dimension(&root, "seven_day", …)` returned. Kept beside
+    /// `weekly_resets_at` (which is the scoped reset while the override holds)
+    /// so `[tunables] weekly_scoped_binding = false` can revert the binding
+    /// weekly reading to the all-models window AND its own reset.
+    weekly_all_resets_at: Option<String>,
     /// The account's paid-extra-usage posture — top-level `extra_usage`, or the
     /// `spend` block's equivalent when the former is absent; `None` when the
     /// response carried neither.
@@ -325,6 +351,10 @@ where
                     weekly_scoped_model: report.weekly_scoped_model.clone(),
                     weekly_scoped_resets_at: report
                         .weekly_scoped_resets_at
+                        .as_deref()
+                        .and_then(epoch_from_resets_at),
+                    weekly_all_resets_at: report
+                        .weekly_all_resets_at
                         .as_deref()
                         .and_then(epoch_from_resets_at),
                     extra_usage: report.extra_usage.clone(),
@@ -533,6 +563,9 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
         dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"])
             .ok_or_else(|| Error::UsageParse("no weekly (seven_day) dimension".into()))?;
     let mut weekly = weekly_all;
+    // The pre-override all-models reset, captured before the scoped override can
+    // overwrite `weekly_resets_at` — `weekly_scoped_binding = false` restores it.
+    let weekly_all_resets_at = weekly_resets_at.clone();
 
     // A per-model `weekly_scoped` cap above the all-models window is the binding
     // constraint — take it over the top-level `seven_day` reading. Either way the
@@ -561,6 +594,7 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
         weekly_scoped,
         weekly_scoped_model,
         weekly_scoped_resets_at,
+        weekly_all_resets_at,
         extra_usage: extra_usage_of(&root),
         session_resets_at,
         weekly_resets_at,
@@ -1535,6 +1569,7 @@ mod tests {
             weekly_scoped: None,
             weekly_scoped_model: None,
             weekly_scoped_resets_at: None,
+            weekly_all_resets_at: None,
             extra_usage: None,
             session_resets_at: Some("2025-01-01T00:00:00Z".to_owned()),
             weekly_resets_at: Some("2025-06-26T18:00:00Z".to_owned()),
@@ -1720,6 +1755,47 @@ mod tests {
         assert!((reading.usage.weekly - 0.70).abs() < 1e-9);
         // No `severity` on either limit → the reading carries none (issue #156).
         assert_eq!(reading.severity, None);
+    }
+
+    #[tokio::test]
+    async fn weekly_scoped_binding_false_reverts_to_the_all_models_weekly() {
+        // Same fixture as `weekly_scoped_higher_than_weekly_all_wins`: Fable's
+        // scoped cap (74 %) outvotes the all-models window (44 %) at parse time.
+        let body = r#"{
+            "five_hour": { "utilization": 0.0, "resets_at": null },
+            "seven_day": { "utilization": 44.0, "resets_at": "2026-09-24T16:00:00.485164+00:00" },
+            "limits": [
+                { "kind": "session", "group": "session", "percent": 0, "severity": "normal",
+                  "resets_at": null, "scope": null, "is_active": false },
+                { "kind": "weekly_all", "group": "weekly", "percent": 44, "severity": "normal",
+                  "resets_at": "2026-09-24T16:00:00.485164+00:00", "scope": null, "is_active": false },
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 74, "severity": "normal",
+                  "resets_at": "2026-09-24T16:00:00.485335+00:00",
+                  "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
+                  "is_active": true }
+            ]
+        }"#;
+        let all_reset = epoch_from_resets_at("2026-09-24T16:00:00.485164+00:00");
+        let scoped_reset = epoch_from_resets_at("2026-09-24T16:00:00.485335+00:00");
+        let src = source(vec![FakeUsageTransport::ok(200, body)]);
+        let reading = src.usage().await.unwrap();
+        // The pre-override all-models reset rides the reading either way.
+        assert_eq!(reading.weekly_all_resets_at, all_reset);
+
+        // `false`: the all-models window binds — `weekly`/`weekly_resets_at`
+        // revert to the `seven_day` values; the scoped breakdown is untouched.
+        let off = reading.clone().with_weekly_scoped_binding(false);
+        assert!((off.usage.weekly - 0.44).abs() < 1e-9);
+        assert_eq!(off.usage.weekly_resets_at, all_reset);
+        assert_eq!(off.usage.weekly_scoped, Some(0.74));
+        assert!((off.usage.weekly_all - 0.44).abs() < 1e-9);
+        assert_eq!(off.weekly_all_resets_at, all_reset);
+
+        // `true`: unchanged — the scoped cap stays the binding reading.
+        let on = reading.with_weekly_scoped_binding(true);
+        assert!((on.usage.weekly - 0.74).abs() < 1e-9);
+        assert_eq!(on.usage.weekly_resets_at, scoped_reset);
+        assert_eq!(on.weekly_all_resets_at, all_reset);
     }
 
     #[tokio::test]

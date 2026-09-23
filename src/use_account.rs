@@ -1379,6 +1379,7 @@ mod tests {
                     severity: None,
                     weekly_scoped_model: None,
                     weekly_scoped_resets_at: None,
+                    weekly_all_resets_at: None,
                     extra_usage: None,
                 }),
                 Probe::Dead => Err(Error::UsageUnauthorized),

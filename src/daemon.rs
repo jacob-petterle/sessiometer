@@ -1758,6 +1758,13 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`Self::selection_tiebreak`] into every `pick_target*` call so the choice AMONG viable
     /// accounts follows it; the viability filter is policy-independent.
     target_policy: crate::config::TargetPolicy,
+    /// Whether a per-model `weekly_scoped` cap may be the binding weekly reading
+    /// (`[tunables] weekly_scoped_binding`, default true). Folded into every poll result
+    /// via [`crate::usage::PolledReading::with_weekly_scoped_binding`]: `false` reverts
+    /// `weekly`/`weekly_resets_at` to the all-models `seven_day` values, so the models
+    /// that bill only that window never park an account on a scoped cap. Hot-reloadable
+    /// through [`Self::adopt_roster_reload`].
+    weekly_scoped_binding: bool,
     /// Base SESSION swap-away threshold as a fraction (`session_ceiling / 100`),
     /// un-jittered — the session-dimension counterpart of [`Self::weekly_ceiling_base`].
     /// The always-on session anti-thrash gate in [`pick_target`] keys off this on the
@@ -2091,6 +2098,7 @@ where
             weekly_ceiling_base: f64::from(tunables.weekly_ceiling) / 100.0,
             weekly_tail_margin: f64::from(tunables.weekly_tail_margin_pct) / 100.0,
             target_policy: tunables.target_policy,
+            weekly_scoped_binding: tunables.weekly_scoped_binding,
             session_ceiling_base: f64::from(tunables.session_ceiling) / 100.0,
             target_max_session_usage: f64::from(tunables.target_max_session_usage) / 100.0,
             session_blind_swap_secs: tunables.session_blind_swap_secs,
@@ -2756,7 +2764,15 @@ where
         if let Some(i) = poll_idx
             .filter(|&i| !self.account_backing_off(i) && !self.exhausted_slow_polling(i, active))
         {
-            let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
+            // The `weekly_scoped_binding` fold lands FIRST, before the sample write and
+            // the `Usage` projection: under `false` every consumer sees the all-models
+            // window as the binding weekly reading while the scoped breakdown still
+            // records. Same fold at the keep-warm and refresh-retry re-polls.
+            let polled = self
+                .poller
+                .poll(&self.roster[i], active == Some(i))
+                .await
+                .map(|r| r.with_weekly_scoped_binding(self.weekly_scoped_binding));
             // Record ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
             // gap and swallowing any store error. The store path is INJECTED (issue #315):
@@ -6334,9 +6350,14 @@ mod tests {
     /// A scripted per-account poll outcome. `Ok` yields a reading; each error
     /// variant drives one of [`Daemon::note_poll_outcome`]'s issue-#9 arms, so the
     /// 401 / keychain-lock / 403 event paths and the 401 streak become testable.
-    #[derive(Clone, Copy)]
+    // Not `Copy`: `OkReading` carries an owned `PolledReading` (severity/model strings).
+    #[derive(Clone)]
     pub(super) enum Scripted {
         Ok(Usage),
+        /// A full [`PolledReading`] scripted verbatim — for the sample-only fields
+        /// (`weekly_scoped*`, `weekly_all_resets_at`, `extra_usage`) that the lean
+        /// [`Scripted::Ok`] cannot express (e.g. the `weekly_scoped_binding` fold).
+        OkReading(PolledReading),
         Transient,
         /// A `429` rate-limit carrying an optional server-advised `Retry-After`
         /// (issue #76) — drives the poll back-off path.
@@ -6434,6 +6455,13 @@ mod tests {
             );
             self
         }
+        /// Script a full [`PolledReading`] verbatim — the `weekly_scoped_binding`
+        /// tests need the scoped/all-models breakdown fields `ok` cannot set.
+        pub(super) fn ok_reading(mut self, uuid: &str, reading: PolledReading) -> Self {
+            self.readings
+                .insert(uuid.to_owned(), Scripted::OkReading(reading));
+            self
+        }
         pub(super) fn failing(mut self, uuid: &str) -> Self {
             self.readings.insert(uuid.to_owned(), Scripted::Transient);
             self
@@ -6475,8 +6503,10 @@ mod tests {
                     severity: None,
                     weekly_scoped_model: None,
                     weekly_scoped_resets_at: None,
+                    weekly_all_resets_at: None,
                     extra_usage: None,
                 }),
+                Some(Scripted::OkReading(reading)) => Ok(reading.clone()),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
                 Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
@@ -6980,6 +7010,9 @@ mod tests {
             // today's rotation behaviour are byte-identical under them.
             weekly_tail_margin_pct: 1,
             target_policy: crate::config::TargetPolicy::SoonestReset,
+            // The shipping default: per-model `weekly_scoped` caps bind. The
+            // `weekly_scoped_binding` fold tests set the daemon field directly.
+            weekly_scoped_binding: true,
             // Issue #452 bounded-blindness preemptive swap: INERT by default (T parked at
             // the kill-switch ceiling) so baseline daemon tests are unperturbed by the new
             // gate; the blind-swap tests override `session_blind_swap_secs` to arm it.
@@ -7292,6 +7325,7 @@ mod tests {
                     severity: None,
                     weekly_scoped_model: None,
                     weekly_scoped_resets_at: None,
+                    weekly_all_resets_at: None,
                     extra_usage: None,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
@@ -8297,6 +8331,98 @@ mod tests {
                 "a band peer must be skipped inside its slow-poll window",
             );
         }
+    }
+
+    // --- [tunables] weekly_scoped_binding ---
+
+    /// The peer reading the fold tests share: a Fable-scoped cap at 1.00 outvoting an
+    /// all-models window at 0.68 — exactly the parked-but-riding shape the tunable exists
+    /// for. The scoped and all-models resets differ so the fold's `weekly_resets_at`
+    /// restore is observable, not just its `weekly` restore.
+    fn scoped_overriding_reading() -> PolledReading {
+        PolledReading {
+            usage: Usage {
+                session: 0.10,
+                weekly: 1.0,
+                weekly_all: 0.68,
+                weekly_scoped: Some(1.0),
+                weekly_resets_at: Some(2_000_000),
+                session_resets_at: None,
+            },
+            severity: None,
+            weekly_scoped_model: Some("Fable".to_owned()),
+            weekly_scoped_resets_at: Some(2_000_000),
+            weekly_all_resets_at: Some(1_000_000),
+            extra_usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn weekly_scoped_binding_false_binds_the_all_models_window() {
+        // `weekly_scoped_binding = false`: the poll fold reverts the binding weekly
+        // reading to the all-models window, so a peer parked at Fable 100 % but only
+        // 68 % all-models is NEITHER carried as exhausted NOR slow-polled — while the
+        // scoped breakdown still records on the reading.
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok_reading("u-B", scoped_overriding_reading()),
+        )
+        .await;
+        daemon.weekly_scoped_binding = false;
+
+        let polled = next_peer_tick(&mut daemon).await;
+        let carried = daemon.state.readings()[1].expect("u-B was polled");
+        assert!((carried.weekly - 0.68).abs() < 1e-9, "{carried:?}");
+        assert_eq!(carried.weekly_resets_at, Some(1_000_000));
+        assert_eq!(
+            carried.weekly_scoped,
+            Some(1.0),
+            "the scoped breakdown is untouched by the fold",
+        );
+        assert!(
+            !polled.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPoll { account, .. } if account == "u-B"
+            )),
+            "all-models 0.68 is below the rotation line → no slow-poll arm: {:?}",
+            polled.events,
+        );
+        // And it is not weekly-exhausted on the wire snapshot either.
+        assert!(
+            !daemon
+                .snapshot(Some(0), &daemon.state.readings(), wall_clock_now_secs())
+                .accounts[1]
+                .weekly_exhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn weekly_scoped_binding_true_keeps_the_scoped_cap_binding() {
+        // The mirror: under the default `weekly_scoped_binding = true` the same reading
+        // stays Fable-bound — `weekly` 1.00 parks the peer as weekly-exhausted (the
+        // `ExhaustedSlowPoll` ENTER edge) with the SCOPED reset carried.
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok_reading("u-B", scoped_overriding_reading()),
+        )
+        .await;
+        assert!(
+            daemon.weekly_scoped_binding,
+            "the fixture ships the default"
+        );
+
+        let polled = next_peer_tick(&mut daemon).await;
+        let carried = daemon.state.readings()[1].expect("u-B was polled");
+        assert!((carried.weekly - 1.0).abs() < 1e-9, "{carried:?}");
+        assert_eq!(carried.weekly_resets_at, Some(2_000_000));
+        assert!(
+            polled.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPoll { account, .. } if account == "u-B"
+            )),
+            "weekly 1.00 ≥ the rotation line → the exhausted ENTER edge: {:?}",
+            polled.events,
+        );
     }
 
     #[tokio::test]
@@ -19138,6 +19264,7 @@ mod tests {
                 weekly_ceiling: 98,
                 weekly_tail_margin_pct: 1,
                 target_policy: "soonest_reset",
+                weekly_scoped_binding: true,
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
             }
@@ -19818,6 +19945,7 @@ mod tests {
             severity: Some("critical".to_owned()),
             weekly_scoped_model: None,
             weekly_scoped_resets_at: None,
+            weekly_all_resets_at: None,
             extra_usage: None,
         });
 
@@ -19873,6 +20001,7 @@ mod tests {
             severity: Some("critical".to_owned()),
             weekly_scoped_model: None,
             weekly_scoped_resets_at: None,
+            weekly_all_resets_at: None,
             extra_usage: None,
         });
         let authored = "alice@example.com";
@@ -19916,6 +20045,7 @@ mod tests {
             severity: None,
             weekly_scoped_model: None,
             weekly_scoped_resets_at: None,
+            weekly_all_resets_at: None,
             extra_usage: None,
         });
 
@@ -19958,6 +20088,7 @@ mod tests {
             severity: None,
             weekly_scoped_model: None,
             weekly_scoped_resets_at: None,
+            weekly_all_resets_at: None,
             extra_usage: None,
         });
         append_sample_for_poll(&samples_path, "work", &ok, 200);
@@ -19998,6 +20129,7 @@ mod tests {
             severity: Some("warning".to_owned()),
             weekly_scoped_model: None,
             weekly_scoped_resets_at: None,
+            weekly_all_resets_at: None,
             extra_usage: None,
         });
 

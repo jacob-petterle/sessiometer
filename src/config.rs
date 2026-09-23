@@ -504,6 +504,13 @@ pub(crate) struct Tunables {
     /// The swap-TARGET selection policy (`"soonest_reset"` | `"fullest_weekly"`, default
     /// `"soonest_reset"`): which viable account the daemon promotes. See [`TargetPolicy`].
     pub(crate) target_policy: TargetPolicy,
+    /// Whether a per-model `weekly_scoped` cap may be the binding weekly reading.
+    /// `true` (default): the highest scoped cap outvotes the all-models window when
+    /// higher — an account whose Fable cap is exhausted is weekly-exhausted.
+    /// `false`: only the all-models `seven_day` window binds; scoped caps are
+    /// recorded in samples but never park an account or fire a swap. Set false
+    /// when the models you run bill only the all-models window.
+    pub(crate) weekly_scoped_binding: bool,
     /// Bounded-blindness preemptive-swap gate threshold `T` (issue #452, ADR-0017), in
     /// seconds: the active account's retained pre-blind anchor (`last_good`, #450) must
     /// be stale beyond this before the gate arms. Promoted from the interim
@@ -697,6 +704,7 @@ impl Default for Tunables {
             weekly_ceiling: DEFAULT_WEEKLY_CEILING,
             weekly_tail_margin_pct: DEFAULT_WEEKLY_TAIL_MARGIN_PCT,
             target_policy: TargetPolicy::SoonestReset,
+            weekly_scoped_binding: true,
             session_blind_swap_secs: DEFAULT_SESSION_BLIND_SWAP_SECS,
             session_blind_risk_band: DEFAULT_SESSION_BLIND_RISK_BAND,
             session_velocity_horizon_secs: DEFAULT_SESSION_VELOCITY_HORIZON_SECS,
@@ -1531,6 +1539,11 @@ struct RawTunables {
     // has always run — the unchanged-behaviour default.
     #[serde(default = "default_target_policy")]
     target_policy: String,
+    // An absent key resolves to `true` — the per-model `weekly_scoped` cap binds, the
+    // unchanged-behaviour default. `false` makes the all-models `seven_day` window the
+    // only binding weekly reading. A plain bool with no range to validate.
+    #[serde(default = "default_weekly_scoped_binding")]
+    weekly_scoped_binding: bool,
     #[serde(default = "default_session_blind_swap_secs")]
     session_blind_swap_secs: i64,
     #[serde(default = "default_session_blind_risk_band")]
@@ -1589,6 +1602,7 @@ impl Default for RawTunables {
             weekly_ceiling: default_weekly_ceiling(),
             weekly_tail_margin_pct: default_weekly_tail_margin_pct(),
             target_policy: default_target_policy(),
+            weekly_scoped_binding: default_weekly_scoped_binding(),
             session_blind_swap_secs: default_session_blind_swap_secs(),
             session_blind_risk_band: default_session_blind_risk_band(),
             session_velocity_horizon_secs: default_session_velocity_horizon_secs(),
@@ -1629,6 +1643,9 @@ fn default_weekly_tail_margin_pct() -> i64 {
 }
 fn default_target_policy() -> String {
     TargetPolicy::SoonestReset.as_str().to_owned()
+}
+fn default_weekly_scoped_binding() -> bool {
+    true
 }
 fn default_session_blind_swap_secs() -> i64 {
     DEFAULT_SESSION_BLIND_SWAP_SECS as i64

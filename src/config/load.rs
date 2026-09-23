@@ -127,10 +127,12 @@ mod tests {
                 target_max_session_usage: 70,
                 session_ceiling: 90,
                 weekly_ceiling: 97,
-                // VALID omits weekly_tail_margin_pct + target_policy → the compiled-in
-                // defaults (1 pp margin, soonest-reset selection).
+                // VALID omits weekly_tail_margin_pct + target_policy +
+                // weekly_scoped_binding → the compiled-in defaults (1 pp margin,
+                // soonest-reset selection, scoped caps binding).
                 weekly_tail_margin_pct: 1,
                 target_policy: TargetPolicy::SoonestReset,
+                weekly_scoped_binding: true,
                 // VALID sets no blind-swap keys → the compiled-in defaults (issue #452).
                 session_blind_swap_secs: 300,
                 session_blind_risk_band: 60,

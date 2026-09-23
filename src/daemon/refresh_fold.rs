@@ -208,6 +208,7 @@ where
                 .poller
                 .poll(&self.roster[i], false)
                 .await
+                .map(|r| r.with_weekly_scoped_binding(self.weekly_scoped_binding))
                 .map(|reading| {
                     // Same extra-usage carry as the primary poll fold (sample-only).
                     self.state.accounts[i].last_extra_usage = reading.extra_usage.clone();

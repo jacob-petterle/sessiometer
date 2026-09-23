@@ -727,7 +727,8 @@ where
 
     /// Hot-apply the reloadable swap tunables from a freshly-loaded `config` onto the live
     /// daemon: `session_ceiling` (base + jitter strategy), `weekly_ceiling` (base + strategy),
-    /// `target_max_session_usage`, `weekly_tail_margin_pct`, and `target_policy`. Everything
+    /// `target_max_session_usage`, `weekly_tail_margin_pct`, `target_policy`, and
+    /// `weekly_scoped_binding`. Everything
     /// else stays restart-only — poll cadences, refresh, the canary switches are not touched.
     ///
     /// Runs on EVERY successful `Config::load_path` inside [`Self::adopt_roster_reload`],
@@ -802,6 +803,13 @@ where
                 t.target_policy.as_str(),
             ));
             self.target_policy = t.target_policy;
+        }
+        if self.weekly_scoped_binding != t.weekly_scoped_binding {
+            changes.push(format!(
+                "weekly_scoped_binding={}→{}",
+                self.weekly_scoped_binding, t.weekly_scoped_binding,
+            ));
+            self.weekly_scoped_binding = t.weekly_scoped_binding;
         }
         if !changes.is_empty() {
             self.pending_events.push(Event::TunablesReload {
@@ -4601,10 +4609,12 @@ mod tests {
         write_tunables_reload_config(
             &config_path,
             &[("u-A", "work")],
-            "weekly_tail_margin_pct = 0\ntarget_policy = \"fullest_weekly\"\n",
+            "weekly_tail_margin_pct = 0\ntarget_policy = \"fullest_weekly\"\n\
+             weekly_scoped_binding = false\n",
         );
         // `reconcile_daemon`'s fixture carries the shipping defaults (session 95 / floor 80 /
-        // weekly 98 / margin 1 / soonest_reset), so the fragment above changes exactly two keys.
+        // weekly 98 / margin 1 / soonest_reset / scoped binding), so the fragment above
+        // changes exactly three keys.
         let mut daemon: FakeDaemon =
             reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path);
         assert!((daemon.weekly_rotation_line() - 0.97).abs() < 1e-9);
@@ -4628,6 +4638,7 @@ mod tests {
             line.contains("target_policy=soonest_reset→fullest_weekly"),
             "{line}"
         );
+        assert!(line.contains("weekly_scoped_binding=true→false"), "{line}");
         for unchanged in [
             "session_ceiling",
             "weekly_ceiling",
@@ -4640,6 +4651,7 @@ mod tests {
         }
         assert_eq!(daemon.weekly_tail_margin, 0.0);
         assert_eq!(daemon.target_policy, TargetPolicy::FullestWeekly);
+        assert!(!daemon.weekly_scoped_binding);
         // The cached-line requirement: the derived line moved with the field — 0.98 − 0.00.
         assert_eq!(daemon.weekly_rotation_line(), 0.98);
     }
@@ -4655,7 +4667,8 @@ mod tests {
             &config_path,
             &[("u-A", "work")],
             "session_ceiling = 95\ntarget_max_session_usage = 80\nweekly_ceiling = 98\n\
-             weekly_tail_margin_pct = 1\ntarget_policy = \"soonest_reset\"\n",
+             weekly_tail_margin_pct = 1\ntarget_policy = \"soonest_reset\"\n\
+             weekly_scoped_binding = true\n",
         );
         let mut daemon: FakeDaemon =
             reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path);

@@ -85,9 +85,12 @@ where
             .promoted
         {
             // The canonical now holds a fresh token → re-poll the ACTIVE account through it.
+            // Same `weekly_scoped_binding` fold as the primary poll, before the `Usage`
+            // projection.
             self.poller
                 .poll(&self.roster[i], true)
                 .await
+                .map(|r| r.with_weekly_scoped_binding(self.weekly_scoped_binding))
                 .map(|reading| {
                     // Same extra-usage carry as the primary poll fold (sample-only).
                     self.state.accounts[i].last_extra_usage = reading.extra_usage.clone();

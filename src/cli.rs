@@ -1616,6 +1616,7 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
         weekly_ceiling: config.tunables.weekly_ceiling,
         weekly_tail_margin_pct: config.tunables.weekly_tail_margin_pct,
         target_policy: config.tunables.target_policy.as_str(),
+        weekly_scoped_binding: config.tunables.weekly_scoped_binding,
         monitor_401_n: config.tunables.monitor_401_n,
         monitor_recovery_m: config.tunables.monitor_recovery_m,
     });
