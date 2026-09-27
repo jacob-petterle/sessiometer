@@ -195,7 +195,7 @@ enum DaemonAction {
     Restart,
     /// `daemon reload` — ask the running daemon to re-read `config.toml` and hot-apply the
     /// reloadable swap tunables (plus any roster additions) in place, no restart. Declared
-    /// [`ReloadIntent::AppendOnly`] — this verb never shrinks the roster.
+    /// [`ReloadIntent::AppendOnly`](crate::daemon::ReloadIntent::AppendOnly) — this verb never shrinks the roster.
     Reload,
 }
 
@@ -2183,7 +2183,7 @@ async fn daemon_restart() -> Result<()> {
 }
 
 /// Ask the running daemon to re-read `config.toml` in place (`daemon reload`): the same
-/// roster-reload signal the roster verbs send, declared [`ReloadIntent::AppendOnly`] — it
+/// roster-reload signal the roster verbs send, declared [`ReloadIntent::AppendOnly`](crate::daemon::ReloadIntent::AppendOnly) — it
 /// hot-applies the reloadable swap tunables and any roster additions, and can never shrink
 /// the roster. Best-effort like every other notify: the outcome (adopted / refused /
 /// `tunables_reload`) lands on the durable event log, which is also where an operator
