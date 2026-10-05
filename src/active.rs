@@ -11,9 +11,12 @@
 //! signals in that order of trust:
 //!   1. the canonical token byte-matches an account's stashed credential → that
 //!      account (exact right after a swap or a re-stash), then
-//!   2. the displayed `accountUuid` maps to a roster account — the only signal when
-//!      the token changed in place and no stash matches it yet (a fresh `/login` or
-//!      a silent in-place refresh).
+//!   2. the canonical's non-empty refresh token byte-matches an account's stashed
+//!      one → that account (Claude Code rewrote the item without rotating the grant),
+//!      then
+//!   3. the displayed `accountUuid` maps to a roster account — the only signal when
+//!      the grant itself is new and no stash holds it yet (a fresh `/login` or a
+//!      rotating refresh).
 //!
 //! Both the daemon's poll loop ([`crate::daemon`]) and the manual `use` swap
 //! ([`crate::use_account`]) resolve the outgoing account through these SAME two
@@ -30,30 +33,58 @@ use crate::keychain::Credential;
 use crate::stash::AccountStash;
 
 /// Identify which roster account the given `canonical` credential belongs to, using
-/// two signals in order: (1) the canonical token byte-matches an account's stash —
-/// exact right after a swap or a re-stash; (2) the displayed `~/.claude.json`
-/// `accountUuid` maps to a roster account — the signal when the token has changed in
-/// place and no stash matches it yet. `None` if neither resolves.
+/// three signals in order: (1) the canonical blob byte-matches an account's stash —
+/// exact right after a swap or a re-stash; (2) the canonical's non-empty REFRESH
+/// token byte-matches an account's stashed one — the same OAuth grant, rewritten in
+/// place by Claude Code without rotating it; (3) the displayed `~/.claude.json`
+/// `accountUuid` maps to a roster account — the signal when the grant itself is new
+/// (a fresh `/login`, or a rotation) and no stash holds it yet. `None` if none resolves.
 ///
 /// Token-first because the keychain credential is the authoritative bearer and
 /// `~/.claude.json` is the clobberable display half (issue #207): a cleared or stale
-/// display still resolves as long as the canonical token matches a stash. Shared by
-/// the daemon's active-resolution and re-auth re-stash paths and the manual `use`
-/// swap's outgoing-account resolution.
+/// display still resolves as long as the canonical token matches a stash. Step (2)
+/// exists because Claude Code rewrites the item without touching the refresh token,
+/// and every such rewrite used to fall straight to the display: a display naming a
+/// different account then made the re-auth re-stash write one account's grant into
+/// another's stash, destroying the second account's own grant. A refresh token is
+/// one grant's bearer, so it attributes the blob more reliably than the display can.
+/// An EMPTY refresh token is the cleared-in-place dead signal and matches nothing.
+/// Shared by the daemon's active-resolution and re-auth re-stash paths and the manual
+/// `use` swap's outgoing-account resolution.
 pub(crate) async fn resolve_account_for<S: AccountStash>(
     roster: &[Account],
     stash: &S,
     claude_json: &Path,
     canonical: &Credential,
 ) -> Option<usize> {
+    let canonical_rt = live_refresh_token(canonical);
+    let mut same_grant = None;
     for (i, account) in roster.iter().enumerate() {
-        if let Ok(stashed) = stash.read(&account.stash()).await {
-            if stashed.credential.matches(canonical) {
-                return Some(i);
+        let Ok(stashed) = stash.read(&account.stash()).await else {
+            continue;
+        };
+        if stashed.credential.matches(canonical) {
+            return Some(i);
+        }
+        if same_grant.is_none() {
+            if let (Some(want), Some(have)) = (
+                canonical_rt.as_ref(),
+                live_refresh_token(&stashed.credential),
+            ) {
+                if want.as_slice() == have.as_slice() {
+                    same_grant = Some(i);
+                }
             }
         }
     }
-    resolve_via_display(roster, claude_json)
+    same_grant.or_else(|| resolve_via_display(roster, claude_json))
+}
+
+/// The credential's refresh token when it is present and non-empty — `None` for an
+/// unparseable blob and for the cleared-in-place dead signal alike, so two cleared
+/// credentials never attribute to each other. Only ever byte-compared, never logged.
+fn live_refresh_token(credential: &Credential) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    crate::refresh::refresh_token(credential.expose()).filter(|rt| !rt.is_empty())
 }
 
 /// The `~/.claude.json` DISPLAY-only fallback: the roster account whose
@@ -191,5 +222,98 @@ mod tests {
         let roster = roster_ab();
         let missing = std::path::Path::new("/nonexistent/.claude.json");
         assert_eq!(resolve_via_display(&roster, missing), None);
+    }
+
+    /// A Claude Code-shaped credential blob: `access` / `refresh` tokens plus a `tier` field
+    /// standing in for the non-token bytes Claude Code rewrites in place.
+    fn oauth_blob(access: &str, refresh: &str, tier: &str) -> Vec<u8> {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":1,"rateLimitTier":"{tier}"}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// A stash holding `work` (`u-A`) and `spare` (`u-B`) as the given blobs.
+    async fn stash_with_blobs(a: &[u8], b: &[u8]) -> FakeAccountStash {
+        let stash = FakeAccountStash::empty();
+        stash
+            .write("Sessiometer/u-A", &stashed(a, "u-A"))
+            .await
+            .unwrap();
+        stash
+            .write("Sessiometer/u-B", &stashed(b, "u-B"))
+            .await
+            .unwrap();
+        stash
+    }
+
+    #[tokio::test]
+    async fn a_grant_rewritten_in_place_resolves_to_its_owner_over_a_stale_display() {
+        // Claude Code rewrote u-A's item without rotating the refresh token, so the blob
+        // matches no stash; the display names u-B. Attributing by the display would re-stash
+        // u-A's grant over u-B's — the shared refresh token resolves it to u-A instead.
+        let roster = roster_ab();
+        let stash = stash_with_blobs(
+            &oauth_blob("at-A1", "rt-A", "t1"),
+            &oauth_blob("at-B1", "rt-B", "t1"),
+        )
+        .await;
+        let (_dir, json) = claude_json_for("u-B");
+        let canonical = cred(&oauth_blob("at-A1", "rt-A", "t2"));
+        assert_eq!(
+            resolve_account_for(&roster, &stash, &json, &canonical).await,
+            Some(0),
+            "the refresh token names the grant's owner; the stale display does not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blob_match_outranks_an_earlier_refresh_token_match() {
+        // u-A's stash shares u-B's refresh token (a stale copy) but only u-B's stash is the
+        // exact blob — the exact match keeps its first rank.
+        let roster = roster_ab();
+        let exact = oauth_blob("at-B2", "rt-B", "t2");
+        let stash = stash_with_blobs(&oauth_blob("at-B1", "rt-B", "t1"), &exact).await;
+        let (_dir, json) = claude_json_for("u-A");
+        assert_eq!(
+            resolve_account_for(&roster, &stash, &json, &cred(&exact)).await,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cleared_refresh_token_never_attributes_by_grant() {
+        // Both the canonical and u-A's stash carry the cleared (empty) refresh token. Empty is
+        // the dead signal, not a shared grant, so resolution falls through to the display.
+        let roster = roster_ab();
+        let stash = stash_with_blobs(
+            &oauth_blob("", "", "t1"),
+            &oauth_blob("at-B1", "rt-B", "t1"),
+        )
+        .await;
+        let (_dir, json) = claude_json_for("u-B");
+        let canonical = cred(&oauth_blob("", "", "t2"));
+        assert_eq!(
+            resolve_account_for(&roster, &stash, &json, &canonical).await,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_grant_still_falls_back_to_the_display() {
+        // A fresh /login or a rotation: the refresh token is in no stash, so the display
+        // remains the signal, exactly as before.
+        let roster = roster_ab();
+        let stash = stash_with_blobs(
+            &oauth_blob("at-A1", "rt-A", "t1"),
+            &oauth_blob("at-B1", "rt-B", "t1"),
+        )
+        .await;
+        let (_dir, json) = claude_json_for("u-B");
+        let canonical = cred(&oauth_blob("at-NEW", "rt-NEW", "t1"));
+        assert_eq!(
+            resolve_account_for(&roster, &stash, &json, &canonical).await,
+            Some(1)
+        );
     }
 }
