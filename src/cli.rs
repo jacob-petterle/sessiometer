@@ -1506,7 +1506,7 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // against a concurrent manual `use` swap on the same native-local `swap.lock`.
     let mut daemon = Daemon::new(
         config.roster.clone(),
-        RealRosterPoller::new(),
+        RealRosterPoller::for_daemon(),
         RealCredentialStore::new(),
         RealAccountStash::new(),
         RealClock::new(),

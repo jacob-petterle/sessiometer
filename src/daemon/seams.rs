@@ -73,12 +73,21 @@ pub(crate) trait RosterPoller {
 /// state (issue #42), not in this per-poll source.
 pub(crate) struct RealRosterPoller {
     stash: RealAccountStash,
+    skip_expired_parked: bool,
 }
 
 impl RealRosterPoller {
     pub(crate) fn new() -> Self {
         Self {
             stash: RealAccountStash::new(),
+            skip_expired_parked: false,
+        }
+    }
+
+    pub(crate) fn for_daemon() -> Self {
+        Self {
+            skip_expired_parked: true,
+            ..Self::new()
         }
     }
 }
@@ -97,6 +106,7 @@ impl RosterPoller for RealRosterPoller {
             RealUsageSource::new(CurlTransport::new(StashCredentialStore {
                 stash: &self.stash,
                 service: account.stash(),
+                skip_expired: self.skip_expired_parked,
             }))
             .usage()
             .await
@@ -110,11 +120,27 @@ impl RosterPoller for RealRosterPoller {
 struct StashCredentialStore<'a, S> {
     stash: &'a S,
     service: String,
+    skip_expired: bool,
 }
 
 impl<S: AccountStash> CredentialStore for StashCredentialStore<'_, S> {
     async fn read(&self) -> Result<Credential> {
-        Ok(self.stash.read(&self.service).await?.credential)
+        let credential = self.stash.read(&self.service).await?.credential;
+        if !self.skip_expired {
+            return Ok(credential);
+        }
+        let blob = credential.expose();
+        let now_ms = wall_clock_now_ms();
+        let is_lapsed = |deadline: i64| deadline > 0 && deadline <= now_ms;
+        // A parked credential can still be read while its access token is live,
+        // or refreshed after a 401 while its refresh grant is live. Require
+        // both deadlines to have passed before suppressing a network request.
+        if crate::refresh::expires_at(blob).is_some_and(is_lapsed)
+            && crate::refresh::refresh_token_expires_at(blob).is_some_and(is_lapsed)
+        {
+            return Err(Error::UsageCredentialExpired);
+        }
+        Ok(credential)
     }
 
     async fn write(&self, _credential: &Credential) -> Result<()> {
@@ -647,7 +673,65 @@ impl InstanceLock {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::stashed;
     use super::*;
+    use crate::stash::FakeAccountStash;
+
+    #[tokio::test]
+    async fn parked_usage_transport_has_no_bearer_after_both_deadlines_lapse() {
+        let stash = FakeAccountStash::empty();
+        let mut store = StashCredentialStore {
+            stash: &stash,
+            service: "parked".to_owned(),
+            skip_expired: true,
+        };
+        let expired = br#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":1000,"refreshTokenExpiresAt":2000}}"#;
+        stash
+            .write(&store.service, &stashed(expired, "u-A"))
+            .await
+            .unwrap();
+
+        // This read supplies the bearer to the real curl transport. Reject it here
+        // so the test exercises the credential boundary without a network request.
+        assert!(matches!(
+            store.read().await,
+            Err(Error::UsageCredentialExpired)
+        ));
+
+        store.skip_expired = false;
+        assert!(store.read().await.is_ok());
+        store.skip_expired = true;
+
+        for blob in [
+            // A newly stashed login is eligible on the very next poll.
+            br#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":9223372036854775807,"refreshTokenExpiresAt":9223372036854775807}}"#.as_slice(),
+            // Refresh expiry alone is not evidence the access token has expired.
+            br#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":9223372036854775807,"refreshTokenExpiresAt":2000}}"#,
+            // An expired access token can still take the existing 401/refresh path.
+            br#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":1000,"refreshTokenExpiresAt":9223372036854775807}}"#,
+            // Older credentials do not carry a refresh deadline.
+            br#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":1000}}"#,
+        ] {
+            stash
+                .write(&store.service, &stashed(blob, "u-A"))
+                .await
+                .unwrap();
+            assert!(store.read().await.is_ok());
+        }
+
+        // Without the guard this fixture fails at token extraction, before curl.
+        let expired_without_token =
+            br#"{"claudeAiOauth":{"expiresAt":1000,"refreshTokenExpiresAt":2000}}"#;
+        stash
+            .write(&store.service, &stashed(expired_without_token, "u-A"))
+            .await
+            .unwrap();
+        let usage = RealUsageSource::new(CurlTransport::new(store));
+        assert!(matches!(
+            usage.usage().await,
+            Err(Error::UsageCredentialExpired)
+        ));
+    }
 
     // Unix-only because the scenario IS a symlink re-point: `std::os::windows::fs::symlink_file`
     // needs either Developer Mode or `SeCreateSymbolicLinkPrivilege`, so the same test on Windows
