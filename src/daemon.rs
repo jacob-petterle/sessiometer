@@ -18666,6 +18666,7 @@ mod tests {
                 service: "Sessiometer/11111111-1111-1111-1111-111111111111".to_owned(),
             },
             Error::UsageTokenUnreadable,
+            Error::UsageCredentialExpired,
             Error::UsageTransient {
                 status: 0,
                 retry_after: None,

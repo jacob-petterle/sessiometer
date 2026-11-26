@@ -504,6 +504,11 @@ pub(crate) enum Error {
     #[error("the stored credential has no usable OAuth access token (re-capture this account)")]
     UsageTokenUnreadable,
 
+    /// The parked credential's access and refresh deadlines have both passed.
+    /// The poller made no HTTP request.
+    #[error("usage poll skipped because both OAuth deadlines have passed (run sessiometer login)")]
+    UsageCredentialExpired,
+
     /// The poll did not complete: a `5xx` server error, or — when `status` is
     /// `0` — `curl` returned no HTTP response at all (DNS / connection / TLS /
     /// timeout). Transient by the taxonomy (5xx / network): back off and skip the
@@ -2329,7 +2334,7 @@ pub(crate) mod tests {
         // message below can say which one this is rather than leaving the reader to guess.
         assert_eq!(
             prose.len(),
-            91,
+            92,
             "the `#[error(...)]` count moved, and a variant having been ADDED OR REMOVED is the \
              EXPECTED cause: `error_prose_of`'s self-consistency check ran first and found that \
              every `#[error(` in the source started an attribute it parsed, which rules out the \
